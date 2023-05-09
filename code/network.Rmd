@@ -1,0 +1,494 @@
+---
+title: "Network plots"
+author: "Mengbo Li"
+date: "`r Sys.Date()`"
+output: 
+   html_document:
+      code_folding: show
+      toc: true
+      toc_float:
+          collapsed: false
+          smooth_scroll: false
+      toc_depth: 3
+      number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r global options, include = FALSE, cache = FALSE}
+options(max.print = "80", digits = 4)
+knitr::opts_chunk$set(echo = FALSE,
+                      cache = FALSE,
+                      prompt = FALSE,
+                      tidy = TRUE,
+                      comment = NA,
+                      message = FALSE,
+                      warning = FALSE, 
+                      fig.align = "center")
+```
+
+
+
+# Summary
+
+Here I try to generate some network plots for the last figure. After several discussions, we have decided to create the protein network from observed data but add on the metabolomic markers in from the DE list post-hoc (send to John). 
+
+
+
+```{r}
+library(here)
+library(tidyverse)
+library(RColorBrewer)
+library(ggsci)
+library(igraph)
+library(mstknnclust)
+library(limma)
+```
+
+
+# Load data and DE lists
+
+```{r}
+# all protein data and meta data, donor topTable LV vs RV
+load("data/network/211115_protData_meta_and_donorLVRVde.rda")
+# all metabolomic data meta data, donor topTable LV vs RV
+load("data/network/211115_metabData_meta_and_donorLVRVde.rda")
+```
+
+
+## Donor data
+
+```{r}
+# take out donors first
+donorID <- pmeta$locBank[pmeta$condition == "Donor"]
+
+# take top 200 DE proteins
+dep <- paste("G", donor$GeneID[1:200], sep = "")
+datDonor <- pt[dep, donorID]
+rownames(datDonor) <- donor$Symbol[1:200]
+
+# rescale to median and adjust by standard deviations
+datDonor <- t(scale(t(datDonor)))
+
+dim(datDonor)
+```
+
+
+Construct the network layout. 
+
+```{r}
+make.knn.graph <- function(D, degree.cutoff = 0.5){
+  # calculate Euclidean distances between cells
+  # dist <- as.matrix(dist(D))
+  # or, use the correlation matrix to construct the KNN network
+  dist <- 1/abs(cor(t(D), use = "pairwise.complete.obs"))
+  graph <- mst.knn(dist)
+  graph <- graph$network
+  V(graph)$label <- V(graph)$name <- rownames(D)[as.numeric(V(graph)$name)]
+  # degree of graph
+  graphdegree <- igraph::degree(graph, v = V(graph), loops = TRUE, normalized = TRUE)
+  # filter nodes without edge
+  graph <- delete.vertices(graph, graphdegree == 0)
+  # filter by degree of graph
+  graph <- delete.vertices(graph, graphdegree < quantile(graphdegree, prob = degree.cutoff))
+  # vertex size will be by degree
+  graphdegree <- graphdegree[V(graph)$name]
+  # edge weights by absolute values of the correlation
+  edgeList <- get.edgelist(graph)
+  edge.wt <- sapply(1:nrow(edgeList), function(i) abs(cor(D[edgeList[i, 1], ], D[edgeList[i, 2], ], use = "pairwise.complete.obs")))
+  # colour edges by correlation (red for positive and blue for negative)
+  corSign <- sapply(1:nrow(edgeList), function(i) sign(cor(D[edgeList[i, 1], ], D[edgeList[i, 2], ], use = "pairwise.complete.obs")))
+  edge.col <- c("#EF3B2C", "#4292C6")[ifelse(corSign == -1, 2, corSign)] # red for +, blue for -
+  # make a layout for visualizing in 2D
+  set.seed(1)
+  g.layout <- layout_with_fr(graph)
+  return(list(graph = graph, 
+              layout = g.layout, 
+              graphdegree = graphdegree, 
+              edge.col = edge.col, 
+              edge.wt = edge.wt))        
+}
+
+donorknn <- make.knn.graph(datDonor, degree.cutoff = 0)
+donorWalktrap <- walktrap.community(donorknn$graph, steps = 10)
+table(donorWalktrap$membership)
+community.list <- lapply(1:max(donorWalktrap$membership), function(i) donorWalktrap$names[donorWalktrap$membership == i])
+```
+
+
+```{r}
+## firstly, the colour palette
+ind <- c(2, 7)
+color.plate <- c(brewer.pal(9, "Purples")[c(4, 6)], brewer.pal(9, "Blues")[c(5, 7)],
+                 brewer.pal(11, "BrBG")[c(8, 9)], pal_material("green")(10)[ind], 
+                 pal_material("lime")(10)[c(4, 8)], pal_material("orange")(10)[c(4, 9)], 
+                 pal_material("yellow")(10)[ind], pal_material("red")(10)[c(2, 3)], 
+                 pal_material("red")(10)[c(5, 6)], brewer.pal(11, "BrBG")[c(4, 3)], 
+                 brewer.pal(11, "PiYG")[c(4, 3)])
+length(color.plate)
+scales::show_col(color.plate)
+set.seed(1)
+sub_color.plate <- color.plate[sample(1:22)]
+scales::show_col(sub_color.plate)
+
+# community highlighting colours, more transparency
+# community.col <- GISTools::add.alpha(str_sub(sub_color.plate, end = 7), alpha = 0.28)
+colorRampAlpha <- function(..., n, alpha) {
+   colors <- colorRampPalette(...)(n)
+   paste(colors, sprintf("%x", ceiling(255*alpha)), sep="")
+}
+community.col <- colorRampAlpha(str_sub(sub_color.plate, end = 7), 
+               n = length(str_sub(sub_color.plate, end = 7)), 
+               alpha = 0.2)
+
+# colour nodes by community
+vert.col <- sub_color.plate[donorWalktrap$membership]
+# vert.frame.col <- vert.col
+vert.frame.col <- data.frame(Symbol = names(V(donorknn$graph))) |> 
+  left_join(select(donor, Symbol, logFC), by = "Symbol") |> 
+  mutate(direction = ifelse(logFC > 0, "salmon", "lightblue"))
+# adjust vertex sizes by nodal degree
+vert.size <- donorknn$graphdegree*288
+vert.size <- ifelse(vert.size < quantile(vert.size, 0.9), 4, 8)
+```
+
+
+Plot: 
+
+```{r}
+plot.igraph(donorknn$graph, layout = donorknn$layout, 
+            # vertex
+            vertex.label = V(donorknn$graph)$label, vertex.label.family = "Helvetica", 
+            vertex.label.font = 2, vertex.label.cex = 0.4, vertex.shape = donorknn$ver.shape, 
+            vertex.label.color = "black", 
+            # vertex.color = vert.col,
+            vertex.color = vert.frame.col$direction,
+            vertex.size = vert.size, vertex.frame.color = vert.frame.col, 
+            # edge
+            edge.color = donorknn$edge.col, #"#404040", # 
+            edge.width = (donorknn$edge.wt*1.5)^2, 
+            # community
+            mark.groups = community.list, mark.border = "#ffffff00",  mark.col = community.col)
+legend("topleft", 
+       legend = 1:22, # community.anno
+       col = sub_color.plate, 
+       pch = 16, cex = 0.6, 
+       bty = "n", pt.cex = 1, 
+       y.intersp = 1.5)
+```
+
+
+
+
+Gene set test in each cluster:
+
+```{r, eval = FALSE}
+# read in gene sets
+## tft
+tft <- readLines(here("data/211122_MSigDB/c3.tft.v7.4.entrez.gmt.txt"))
+tft <- lapply(1:length(tft), function(i) limma::strsplit2(tft[i], "\t")[-2])
+names(tft) <- sapply(tft, "[", 1)
+tft <- lapply(tft, "[", -1)
+length(tft)
+## GO-BP
+bp <- readLines(here("data/211122_MSigDB/c5.go.bp.v7.4.entrez.gmt.txt"))
+bp <- lapply(1:length(bp), function(i) limma::strsplit2(bp[i], "\t")[-2])
+names(bp) <- sapply(bp, "[", 1)
+bp <- lapply(bp, "[", -1)
+length(bp)
+## GO-MF
+mf <- readLines(here("data/211122_MSigDB/c5.go.mf.v7.4.entrez.gmt.txt"))
+mf <- lapply(1:length(mf), function(i) limma::strsplit2(mf[i], "\t")[-2])
+names(mf) <- sapply(mf, "[", 1)
+mf <- lapply(mf, "[", -1)
+length(mf)
+```
+
+
+```{r, eval = FALSE}
+# genes in each cluster
+geneClusters <- lapply(1:22, function(x) donorWalktrap[[x]])
+geneCusters_id <- lapply(1:22, function(x) {
+  filter(donor, Symbol %in% donorWalktrap[[x]])$GeneID
+})
+
+# Test a cluster on each gene set of interest by camera
+testAcluster <- function(genesInCluster, geneSets) {
+  index <- lapply(1:length(geneSets), function(i) {
+    thisGS <- geneSets[[i]]
+    ind <- intersect(paste("G", thisGS, sep = ""), 
+                     paste("G", donor$GeneID, sep = ""))
+    if (length(ind) < 5) res <- NA
+      else {
+        ind2 <- paste("G", intersect(geneSets[[i]], genesInCluster), sep = "")
+        if (length(ind2) < 2) 
+          res <- NA
+        else {
+          allStats <- dplyr::filter(donor, GeneID %in% thisGS)
+          indStats <- allStats$t
+          names(indStats) <- paste("G", allStats$GeneID, sep = "")
+          index4test <- which(names(indStats) %in% ind2)
+          res <- cameraPR(indStats, index = index4test)
+        }
+      }
+    return(res)
+  })
+}
+
+# test all clusters
+testCollection <- function(clusterID = 1:18, geneCusters_id, collection = tft) {
+  lapply(clusterID, function(i) {
+    tmpRes <- testAcluster(geneCusters_id[[i]], collection)
+    names(tmpRes) <- names(collection)
+    keep <- sapply(tmpRes, length) > 1
+    res <- do.call(rbind, tmpRes[keep])
+    return(res)
+  })
+}
+```
+
+
+For each collection, take the top 5 annotations for each cluster: 
+
+```{r, eval = FALSE}
+donor_tft <- testCollection(1:22, geneCusters_id, tft)
+donor_bp <- testCollection(1:22, geneCusters_id, bp)
+donor_mf <- testCollection(1:22, geneCusters_id, mf)
+
+donorAnno <- lapply(1:22, function(i) {
+  if (is.null(donor_tft[[i]])) tftRes <- NA else {
+  tfts <- arrange(donor_tft[[i]], PValue)
+  ind_tfts <- tfts$PValue <= 0.05
+  tftRes <- paste("TFT: ", paste(rownames(tfts)[1:min(5,sum(ind_tfts))],
+                                        collapse = "; "), 
+                         sep = "") %>% str_remove_all("_TARGET_GENES")}
+  
+  if (is.null(donor_bp[[i]])) bpRes <- NA else {
+  bps <- arrange(donor_bp[[i]], PValue)
+  ind_bps <- bps$PValue <= 0.05
+  bpRes <- paste("GOBP: ", tolower(paste(rownames(bps)[1:min(5,sum(ind_bps))],
+                                          collapse = "; ") %>% str_remove_all("GOBP_")), sep = "")}
+  
+  if (is.null(donor_mf[[i]])) mfRes <- NA else {
+  mfs <- arrange(donor_mf[[i]], PValue)
+  ind_mfs <- mfs$PValue <= 0.05
+  mfRes <- paste("GOMF: ", tolower(paste(rownames(mfs)[1:min(5,sum(ind_mfs))],
+                                          collapse = "; ") %>% str_remove_all("GOMF_")), sep = "")}
+  
+  data.frame(cluster = NA, 
+             tft = tftRes, 
+             gobp = bpRes, 
+             gomf = mfRes)
+}) %>% do.call(rbind, .)
+donorAnno$cluster <- 1:max(donorWalktrap$membership)
+
+write.csv(donorAnno, file = here("data/211122_MSigDB/211122_donor_network_cluster_annotations.csv"),
+          row.names = FALSE)
+```
+
+
+## ICM data
+
+```{r}
+# Load ICM topTables
+icmProt <- read.csv(here("data/network/211105_Proteomics_ICM_LVvsRV_DE.csv"))
+icmID <- pmeta$locBank[pmeta$condition == "ICM"]
+
+# take top 200 proteins
+dep <- paste("G", icmProt$GeneID[1:200], sep = "")
+datIcm <- pt[dep, icmID]
+rownames(datIcm) <- icmProt$Symbol[1:200]
+
+# rescale to median and adjust by standard deviations
+datIcm <- t(scale(t(datIcm)))
+dim(datIcm)
+```
+
+
+```{r}
+icmknn <- make.knn.graph(datIcm, degree.cutoff = 0)
+icmWalktrap <- walktrap.community(icmknn$graph, steps = 10)
+table(icmWalktrap$membership)
+community.list <- lapply(1:max(icmWalktrap$membership), function(i) icmWalktrap$names[icmWalktrap$membership == i])
+```
+
+
+
+```{r}
+set.seed(4)
+sub_color.plate <- color.plate[sample(1:22)][1:18]
+scales::show_col(sub_color.plate)
+
+# community highlighting colours, more transparency
+community.col <- GISTools::add.alpha(str_sub(sub_color.plate, end = 7), alpha = 0.28)
+
+# colour nodes by community
+vert.col <- sub_color.plate[icmWalktrap$membership]
+
+vert.frame.col <- vert.col
+
+vert.frame.col <- data.frame(Symbol = names(V(icmknn$graph))) |> 
+  left_join(select(icmProt, Symbol, logFC), by = "Symbol") |> 
+  mutate(direction = ifelse(logFC > 0, "salmon", "lightblue"))
+
+# adjust vertex sizes by nodal degree
+vert.size <- icmknn$graphdegree*288
+vert.size <- ifelse(vert.size < quantile(vert.size, 0.9), 4, 8)
+```
+
+Plot: 
+
+```{r}
+plot.igraph(icmknn$graph, layout = icmknn$layout, 
+            # vertex
+            vertex.label = V(icmknn$graph)$label, vertex.label.family = "Helvetica", 
+            vertex.label.font = 2, vertex.label.cex = 0.4, vertex.shape = icmknn$ver.shape, 
+            vertex.label.color = "black", 
+            # vertex.color = vert.col, 
+            vertex.color = vert.frame.col$direction, 
+            vertex.size = vert.size, vertex.frame.color = vert.col, 
+            # edge
+            edge.color = "#404040", edge.width = (icmknn$edge.wt*1.5)^2, 
+            # community
+            mark.groups = community.list, mark.border = "#ffffff00")
+            # ,  mark.col = community.col)
+legend("topleft", 
+       legend = 1:18, # community.anno
+       col = sub_color.plate, 
+       pch = 16, cex = 0.6, 
+       bty = "n", pt.cex = 1, 
+       y.intersp = 1.5)
+```
+
+
+For each collection, take the top 5 annotations for each cluster: 
+
+```{r}
+# genes in each cluster
+geneClusters <- lapply(1:18, function(x) icmWalktrap[[x]])
+geneCusters_id <- lapply(1:18, function(x) {
+  filter(donor, Symbol %in% icmWalktrap[[x]])$GeneID
+})
+
+icm_tft <- testCollection(1:18, geneCusters_id, tft)
+icm_bp <- testCollection(1:18, geneCusters_id, bp)
+icm_mf <- testCollection(1:18, geneCusters_id, mf)
+
+icmAnno <- lapply(1:18, function(i) {
+  if (is.null(icm_tft[[i]])) tftRes <- NA else {
+  tfts <- arrange(icm_tft[[i]], PValue)
+  ind_tfts <- tfts$PValue <= 0.05
+  tftRes <- paste("TFT: ", paste(rownames(tfts)[1:min(5,sum(ind_tfts))],
+                                        collapse = "; "), 
+                         sep = "") %>% str_remove_all("_TARGET_GENES")}
+  
+  if (is.null(icm_bp[[i]])) bpRes <- NA else {
+  bps <- arrange(icm_bp[[i]], PValue)
+  ind_bps <- bps$PValue <= 0.05
+  bpRes <- paste("GOBP: ", tolower(paste(rownames(bps)[1:min(5,sum(ind_bps))],
+                                          collapse = "; ") %>% str_remove_all("GOBP_")), sep = "")}
+  
+  if (is.null(icm_mf[[i]])) mfRes <- NA else {
+  mfs <- arrange(icm_mf[[i]], PValue)
+  ind_mfs <- mfs$PValue <= 0.05
+  mfRes <- paste("GOMF: ", tolower(paste(rownames(mfs)[1:min(5,sum(ind_mfs))],
+                                          collapse = "; ") %>% str_remove_all("GOMF_")), sep = "")}
+  
+  data.frame(cluster = NA, 
+             tft = tftRes, 
+             gobp = bpRes, 
+             gomf = mfRes)
+}) %>% do.call(rbind, .)
+icmAnno$cluster <- 1:18
+
+write.csv(icmAnno, file = here("data/211122_MSigDB/211122_ICM_network_cluster_annotations.csv"), 
+          row.names = FALSE)
+```
+
+
+
+
+
+
+
+
+
+
+## DCM data
+
+```{r}
+# Load DCM topTables
+dcmProt <- read.csv(here("data/network/211105_Proteomics_DCM_LVvsRV_DE.csv"))
+dcmID <- pmeta$locBank[pmeta$condition == "DCM"]
+
+# take top 100 proteins 
+dep <- paste("G", dcmProt$GeneID[dcmProt$adj.P.Val <= 0.05], sep = "")
+datDcm <- pt[dep, dcmID]
+rownames(datDcm) <- dcmProt$Symbol[dcmProt$adj.P.Val <= 0.05]
+
+# rescale to median and adjust by standard deviations
+datDcm <- t(scale(t(datDcm)))
+
+dim(datDcm)
+```
+
+
+```{r}
+dcmknn <- make.knn.graph(datDcm, degree.cutoff = 0)
+dcmWalktrap <- walktrap.community(dcmknn$graph, steps = 10)
+table(dcmWalktrap$membership)
+community.list <- lapply(1:max(dcmWalktrap$membership), function(i) dcmWalktrap$names[dcmWalktrap$membership == i])
+```
+
+Colour codes: 
+
+```{r}
+sub_color.plate <- color.plate[seq(1, 7, 2)]
+
+# community highlighting colours, more transparency
+community.col <- GISTools::add.alpha(str_sub(sub_color.plate, end = 7), alpha = 0.28)
+
+# colour nodes by community
+vert.col <- sub_color.plate[dcmWalktrap$membership]
+vert.frame.col <- vert.col
+
+vert.frame.col <- data.frame(Symbol = names(V(dcmknn$graph))) |> 
+  left_join(select(dcmProt, Symbol, logFC), by = "Symbol") |> 
+  mutate(direction = ifelse(logFC > 0, "salmon", "lightblue"))
+
+# adjust vertex sizes by nodal degree
+vert.size <- dcmknn$graphdegree*8
+```
+
+
+
+Plot: 
+
+```{r}
+plot.igraph(dcmknn$graph, layout = dcmknn$layout, 
+            # vertex
+            vertex.label = V(dcmknn$graph)$label, vertex.label.family = "Helvetica", 
+            vertex.label.font = 2, vertex.label.cex = 0.4, vertex.shape = dcmknn$ver.shape, 
+            vertex.label.color = "black", 
+            # vertex.color = vert.col[2], 
+            vertex.color = vert.frame.col$direction, 
+            vertex.size = vert.size, vertex.frame.color = vert.col[2], 
+            # edge
+            edge.color = "#404040", edge.width = (dcmknn$edge.wt*1.8)^2)
+```
+
+
+
+
+
+
+
+
+
+<br><br><br><br>
+# Session information
+
+```{r}
+sessioninfo::session_info()
+```
+

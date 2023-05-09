@@ -1,0 +1,1951 @@
+---
+title: "Molecular differences in LV/RV donor hearts in Sydney Heart Bank batches"
+author: "Mengbo Li"
+date: "`r Sys.Date()`"
+output: 
+   html_document:
+      code_folding: show
+      toc: true
+      toc_float:
+          collapsed: false
+          smooth_scroll: false
+      toc_depth: 3
+      number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r global options, include = FALSE, cache = FALSE}
+options(max.print = "80", digits = 4)
+knitr::opts_chunk$set(echo = FALSE,
+                      cache = FALSE,
+                      prompt = FALSE,
+                      tidy = TRUE,
+                      comment = NA,
+                      message = FALSE,
+                      warning = FALSE, 
+                      fig.align = "center")
+```
+
+
+```{r}
+library(here)
+library(tidyverse)
+library(RColorBrewer)
+library(ggpubr)
+library(DT)
+library(pheatmap)
+library(ggrepel)
+library(grid)
+library(ggsci)
+
+library(ruv)
+library(ruvms)
+library(limma)
+library(org.Hs.eg.db)
+library(KEGGREST)
+
+source(here("data/utils.R"))
+# replace pastel color for LV/RV
+locolor <- c(brewer.pal(9, "PiYG")[3], brewer.pal(9, "Blues")[7])
+```
+
+```{r}
+smooth_genewise_cor <- function(y, dupcor) {
+   na.atanh <- is.finite(dupcor$atanh.correlations)
+   avgExpr <- rowMeans(y, na.rm = TRUE)
+   o <- order(avgExpr[na.atanh])
+   smooth.cor <- tricubeMovingAverage(dupcor$atanh.correlations[na.atanh][o], span = 0.2)
+   smooth.cor <- smooth.cor[match(1:length(o), o)]
+   correlation <- NA
+   correlation[na.atanh] <- smooth.cor
+   # estimate correlation for NAs
+   est_na <- approx(avgExpr[na.atanh], smooth.cor, xout = avgExpr[!na.atanh], rule = 2, ties = min)$y
+   correlation[!na.atanh] <- est_na
+   correlation
+}
+```
+
+# Load data
+
+```{r}
+load(here("data/210724_SHB2018_raw_intensity.rda"))
+load(here("data/210726_SHB2020_raw_intensity.rda"))
+```
+
+```{r, include=FALSE, eval=FALSE}
+db <- inner_join(meta18, dplyr::select(meta20, bank, diabetes), by = "bank") %>% 
+  distinct() %>% 
+  dplyr::select(sample, diabetes)
+meta18 <- left_join(meta18, db, by = "sample")
+meta <- add_row(meta18, meta20) %>% 
+  mutate(diabetes = factor(diabetes, levels = c("Yes", "No"))) %>% 
+  filter(bank != "2.041") %>% 
+  mutate(year = factor(year, levels = c("2018", "2020"))) %>% 
+  mutate(condition = factor(condition, levels = c("Donor", "DCM", "ICM", "HCM", "HOCM")))
+meta <- filter(meta, condition != "HOCM")
+# keep only subjects with both LV and RV
+meta20 <- filter(meta, year == "2020")
+subHasRV <- filter(meta20, location == "RV")
+excludeSmps <- filter(meta20, !(bank %in% subHasRV$bank))
+meta <- filter(meta, !(sample %in% excludeSmps$sample))
+# dim(meta)
+# table(meta$year)
+meta <- filter(meta, condition != "HCM")
+```
+
+## Filter proteins
+
+To integrate the two batches, we include only proteins that are measured in both batches by mapped gene Entrez ID. For multiple proteins mapped to the same gene by Entrez ID, we take the average of all proteins mapped to the same Entrez ID (p = 2835). Then we further filter out proteins that are missing in more than 75% samples in each batch. This leaves us 2793 proteins. 
+
+```{r, fig.width=5, fig.height=2.8}
+load(here("data/210729_shb_combined.rda"))
+raw[is.nan(raw)] <- NA
+meta <- mutate(meta, condition = factor(condition, levels = c("Donor", "DCM", "ICM")))
+# fix age of subject 3.075
+meta[meta$bank == "3.075", "age"] <- 43
+# fix the subject name
+needfix <- which(meta$bank == "2.1")
+meta[needfix, "sample"] <- c("LV_2.100_27", "RV_2.100_122")
+meta[needfix, "locBank"] <- c("LV_2.100", "RV_2.100")
+meta[needfix, "bank"] <- "2.100"
+meta[needfix, "smpName"] <- c("20_LV_2.100_27", "20_RV_2.100_122")
+# dim(raw)
+rownames(raw)[needfix] <- c("20_LV_2.100_27", "20_RV_2.100_122")
+raw18 <- raw[meta$year == "2018", ]
+raw20 <- raw[meta$year == "2020", ]
+# Proportion of missing data
+sum(is.na(raw18)/length(raw18))
+sum(is.na(raw20)/length(raw20))
+
+missing <- data.frame(m2018 = colSums(is.na(raw18))/nrow(raw18), 
+                      m2020 = colSums(is.na(raw20))/nrow(raw20), 
+                      all = colSums(is.na(raw))/nrow(raw)) %>% 
+  pivot_longer(cols = 1:3) %>% 
+  mutate(name = ifelse(str_detect(name, "m"), str_sub(name, start = 2), name))
+ggplot(filter(missing, name != "all"), aes(x = value, fill = name)) + 
+   geom_density(alpha = 0.4) + 
+   geom_vline(xintercept = 0.75, linetype = "dashed") + 
+   theme_bw() + 
+   labs(x = "NA%", y = "Density", fill = "Year") + 
+   ggtitle("Missing samples(%)")
+
+raw <- raw[, colSums(is.na(raw18))/nrow(raw18) <= 0.75|colSums(is.na(raw20))/nrow(raw20) <= 0.75]
+# dim(raw)
+prot <- prot[colnames(raw), ]
+```
+
+
+
+## Transformation and normalisation to merge the two batches
+
+We apply `ruvms` normalisation. Low variance (< 50%) proteins (nc = 527) are used as negative controls. The data set we consider is 119 by 2793. 
+
+```{r}
+raw <- log2(raw)
+outlier <- c("18_LV_3.153_5", "18_RV_3.153_26", 
+             "18_LV_3.159_41", "20_RV_2.084_113")
+raw <- raw[-which(rownames(raw) %in% outlier), ]
+meta <- filter(meta, !(smpName %in% outlier))
+protvar <- Rfast::colVars(raw)
+ctl <- protvar <= median(protvar, na.rm = TRUE) & !is.na(protvar)
+# table(ctl)
+M <- replicate.matrix(meta$locBank)
+# dim(M)
+rownames(M) <- rownames(raw)
+# table(colSums(M))
+norm <- ruvms(raw, M, ctl)
+# dim(norm)
+```
+
+
+
+```{r}
+# for write raw meta file later 
+dim(meta)
+raw_meta_for_output <- dplyr::select(meta, sample, smpName, year, condition, location)
+```
+
+
+## Subject summary
+
+```{r, fig.width=20, fig.height=5}
+subj <- dplyr::select(meta, bank, year, condition, age, sex, diabetes) %>%
+  distinct()
+dups <- filter(subj, bank %in% bank[duplicated(bank)], year == "2018") %>% mutate(year = "Crossover")
+uniques <- filter(subj, !duplicated(bank)) %>% mutate(year = "Merged")
+subj <- add_row(subj, dups) %>% add_row(uniques) %>% 
+  mutate(year = factor(year, levels = c("Merged", "Crossover", "2020", "2018")))
+subjSummary <- ggplot(subj, aes(x = condition, y = year, color = condition)) + 
+  geom_count(alpha = 0.8) + 
+  scale_size_continuous(range = c(2, 20)) +
+  scale_color_manual(values = brewer.pal(6, "Dark2")) + 
+  theme_pubclean()
+subjSummary <- subjSummary + 
+  geom_text(data = ggplot_build(subjSummary)$data[[1]], 
+            aes(x = x, y = y, label = n, size = n/12), fontface = 2, color = "black") + 
+  guides(size = "none", color = "none") + 
+  labs(x = "Condition", y = "Year", color = "Condition") + 
+  ggtitle("Individual hearts")
+
+subj <- filter(subj, year %in% c("2018", "2020")) %>% 
+  mutate(year = factor(year, levels = c("2018", "2020"))) %>% 
+  filter(!duplicated(bank))
+median_age <- group_by(subj, condition) %>% summarise(med = median(age))
+age <- ggplot(subj, aes(x = condition, y = age, fill = condition)) + 
+  geom_boxplot(alpha = 0.8) + 
+  scale_fill_manual(values = brewer.pal(6, "Dark2")) + 
+  geom_text(data = median_age, aes(x = condition, y = med, label = med), size = 5, vjust = -0.5, fontface = 2) + 
+  theme_bw() + 
+  labs(x = "Condition", y = "Age", fill = "Condition") + 
+  ggtitle("Age")
+sex <- ggplot(subj, aes(x = condition, fill = sex)) + 
+  geom_bar() + 
+  geom_text(aes(label = ..count..), stat = "count", 
+            position = position_stack(vjust = 0.5), size = 8, fontface = 2) + 
+  scale_fill_manual(values = brewer.pal(3, "Pastel2")) + 
+  theme_bw() + 
+  labs(x = "Condition", y = "Count", fill = "Gender") + 
+  ggtitle("Gender")
+ggarrange(subjSummary, sex, age, nrow = 1)
+```
+
+
+## Sample summary
+
+```{r, fig.height=2.8, fig.width=8}
+meta_forPlot <- dplyr::select(meta, sample, condition, location, locBank, year) %>% 
+  mutate(hasrep = c("Singleton", "Replication")[locBank %in% locBank[duplicated(locBank)] + 1]) %>% 
+  mutate(hasrep = str_c(location, hasrep, sep = "~")) %>% 
+  mutate(hasrep = factor(hasrep, levels = c("LV~Singleton", "LV~Replication", "RV~Singleton", "RV~Replication"))) %>% 
+  mutate(condition = factor(condition, levels = c("Donor", "DCM", "ICM")))
+smp1 <- ggplot(meta_forPlot, aes(x = condition, fill = location)) + 
+  geom_bar() + 
+  geom_text(aes(label = ..count..), stat = "count", 
+            position = position_stack(vjust = 0.5), size = 4, fontface = 2) + 
+  scale_fill_manual(values = locolor) + 
+  theme_classic2() + 
+  labs(x = "Condition", y = "Sample count", fill = "Location") + 
+  ggtitle("Merged data")
+smp2 <- ggplot(meta_forPlot, aes(x = condition, fill = location)) + 
+  geom_bar() + 
+  geom_text(aes(label = ..count..), stat = "count", 
+            position = position_stack(vjust = 0.5), size = 4, fontface = 2) + 
+  facet_wrap(~year) + 
+  scale_fill_manual(values = locolor) + 
+  theme_classic2() + 
+  labs(x = "Condition", y = "Sample count", fill = "Location") + 
+  ggtitle("Sample summary of the two batches")
+ggarrange(smp1, smp2, widths = c(1, 2))
+```
+
+
+```{r, fig.height=1.8, fig.width=20}
+meta_forTile <- dplyr::select(meta, locBank, condition, location, year) %>% 
+  mutate(tmp = paste(locBank, year, sep = "_")) %>% 
+  dplyr::mutate(withinYear = ifelse(tmp %in% tmp[duplicated(tmp)], "*", NA)) %>%
+  dplyr::select(-tmp) %>% 
+  distinct() %>% 
+  dplyr::mutate(acrossYear = ifelse(locBank %in% locBank[duplicated(locBank)], 
+                                   "^", NA)) %>% 
+  dplyr::select(-year) %>% 
+  filter(!duplicated(locBank)) %>% 
+  mutate(Bank = str_sub(locBank, start = 4)) %>% 
+  mutate(location = factor(location, levels = c("RV", "LV"))) %>% 
+  arrange(condition, Bank) %>% 
+  mutate(Bank = factor(Bank, levels = unique(Bank)))
+
+conditions <- c("Donor", "DCM", "ICM")
+reps <- lapply(1:3, function(i) {
+  ggplot(data = filter(meta_forTile, condition == conditions[i]),
+         aes(x = Bank, y = location, fill = condition)) +
+    geom_tile(color = "white", size = 0.2, alpha = 0.8) +
+    geom_text(aes(label = withinYear), size = 8.8, vjust = 0.9, color = "white",
+              fontface = 2) +
+    geom_text(aes(label = acrossYear), size = 6.8, vjust = 0.2, color = "white") +
+    scale_fill_manual(values = brewer.pal(6, "Dark2")[i]) +
+    theme_classic() +
+    coord_equal() +
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+    labs(x = "Heart ID", y = "Location", fill = "Condition")
+})
+ggplot(meta_forTile, aes(x = Bank, y = location, fill = condition)) +
+    geom_tile(color = "white", size = 0.2, alpha = 0.8) +
+    geom_text(aes(label = withinYear), size = 8.8, vjust = 0.9, color = "white",
+              fontface = 2) +
+    geom_text(aes(label = acrossYear), size = 6.8, vjust = 0.2, color = "white") +
+    scale_fill_manual(values = brewer.pal(6, "Dark2")) +
+    theme_classic() +
+    coord_equal() +
+    theme(axis.text.x = element_text(angle = 80, vjust = 0.5, hjust = 0.4, size = 7), 
+          axis.ticks.x = element_blank()) +
+    labs(x = "Heart ID", y = "Location", fill = "Condition")
+```
+
+where * = has a within batch replication, ^ = has a cross batch replication. 
+
+MDS plots: 
+
+```{r, fig.width=12, fig.height=5}
+mds <- ggMDS(raw, meta, "raw") %>% add_row(ggMDS(norm, meta, "normalised")) %>% 
+  mutate(label = factor(label, levels = c("raw", "normalised"))) %>% 
+  mutate(yearLoc = str_c(year, location, sep = "~"))
+
+ggplot(mds, aes(x = x, y = y, color = year, shape = location)) + 
+  geom_point(size = 2, alpha = 1, stroke = 0.8) + 
+  facet_wrap(~ label, ncol = 2, scales = "free") + 
+  theme_classic2() + 
+  scale_shape_manual(values = c(16, 8)) + 
+  scale_color_manual(values = brewer.pal(4, "Set2")[2:3]) + 
+  labs(x = "Leading logFC dim 1", y = "Leading logFC dim 2", 
+       color = "Year", shape = "Location")
+```
+
+
+Highlight donor samples: 
+
+```{r, fig.height=4, fig.width=5.8}
+mdsNorm <- filter(mds, label == "normalised")
+ggplot() + 
+  geom_point(data = add_row(filter(mdsNorm, condition != "Donor"), 
+                            filter(mdsNorm, condition == "Donor")), 
+             aes(x = x, y = y, color = condition, shape = location), 
+             size = 2, alpha = 0.8, stroke = 0.8) + 
+  theme_classic2() + 
+  scale_shape_manual(values = c(16, 8)) + 
+  scale_color_manual(values = c(brewer.pal(8, "Dark2")[1], 
+                                brewer.pal(8, "Greys")[4], 
+                                brewer.pal(8, "Greys")[4], 
+                                brewer.pal(8, "Greys")[4])) + 
+  labs(x = "Leading logFC dim 1", y = "Leading logFC dim 2", 
+       color = "Condition", shape = "Location")
+```
+
+Also provide RLA plot as a diagnostic for effective normalisation: 
+
+```{r, fig.width=16, fig.height=6}
+par(mfrow = c(1, 2))
+RLA(raw, repCol = brewer.pal(4, "Set2")[2:3][as.numeric(meta$year)], repLabel = c("2018", "2020"), ylim = c(-4, 10), title = "Raw")
+RLA(norm, repCol = brewer.pal(4, "Set2")[2:3][as.numeric(meta$year)], repLabel = c("2018", "2020"), ylim = c(-4, 10), title = "Merged")
+```
+
+
+
+
+
+# Differential analysis
+
+```{r}
+M <- replicate.matrix(meta$locBank)
+# dim(M)
+meta <- filter(meta, !duplicated(locBank))
+# dim(meta)
+Anorm <- do.call(rbind, lapply(1:ncol(M), function(i) colMeans(norm[M[, i] == 1, , drop = FALSE], na.rm = TRUE)))
+rownames(Anorm) <- colnames(M)
+Anorm <- Anorm[meta$locBank, ]
+Anorm[is.nan(Anorm)] <- NA
+# NA%
+dim(Anorm)
+sum(is.na(Anorm)) / length(Anorm)
+```
+
+
+## Design and contrasts
+
+We are interested in whether there are any differentially expression in donors between the left and the right ventricle tissue samples. Design is constructed to adjust for log2 age and gender. 
+
+```{r}
+meta <- mutate(meta, group = paste(condition, location, sep = "_")) %>% 
+  mutate(log2age = log2(age))
+design <- model.matrix(~ 0 + group + log2age + sex, data = meta)
+colnames(design)[1:6] <- str_sub(colnames(design)[1:6], start = 6)
+contrasts <- makeContrasts(donor = Donor_LV - Donor_RV, levels = design)
+```
+
+```{r, include = FALSE}
+dim(raw_meta_for_output)
+dim(M)
+dim(Anorm)
+
+
+raw_meta_for_output <- mutate(raw_meta_for_output, raw_sample_id = paste("Raw_SmpID", 1:nrow(M), sep = "_"), .before = year)
+M_output <- M
+rownames(M_output) <- raw_meta_for_output$raw_sample_id
+
+smp_orders <- data.frame(locBank = colnames(M))
+
+# save prot data and meta data
+prot_data <- t(Anorm)
+dim(prot_data)
+dim(meta)
+prot_meta <- dplyr::select(meta, locBank, condition, location) %>% 
+  mutate(sample = paste("Sample", 1:88, sep = ""), .before = 1)
+# table(prot_meta$locBank == colnames(prot_data))
+colnames(prot_data) <- prot_meta$sample
+
+smp_orders <- left_join(smp_orders, prot_meta, by = "locBank")
+head(smp_orders)
+colnames(M_output) <- smp_orders$sample
+
+prot_meta <- dplyr::select(prot_meta, -locBank)
+head(prot_meta)
+
+table(rownames(prot_data) == rownames(prot))
+rownames(prot_data) <- prot$Symbol
+
+raw_meta_for_output_complete <- raw_meta_for_output
+raw_meta_for_output <- dplyr::select(raw_meta_for_output, raw_sample_id, year, condition, location)
+
+
+# # write normalised proteomics data
+# write.csv(prot_data, file = "tables/protein_data_normalised.csv")
+# write.csv(prot_meta, file = "tables/protein_metadata.csv")
+# write.csv(M_output, file = "tables/230317-protein_metadata_RawSampleID_to_MergedID.csv")
+# write.csv(raw_meta_for_output, file = "tables/230317-protein_RawMeta.csv")
+# write.csv(raw_meta_for_output_complete, file = "tables/230318-protein_RawMeta_nonAnonymized.csv")
+```
+
+
+
+
+## Differential expression summary
+
+Positive FC means higher expression in LV over RV.
+
+```{r}
+Anorm <- t(Anorm)
+suppressWarnings(dupcor <- duplicateCorrelation(Anorm, design, block = meta$bank))
+correlations <- smooth_genewise_cor(Anorm, dupcor)
+fit <- lmFit2(Anorm, design, block = meta$bank, correlation = correlations)
+fit <- contrasts.fit(fit, contrasts = contrasts)
+efit <- eBayes(fit)
+summary(decideTests(efit))
+```
+
+
+## Differentially expressed proteins
+
+```{r}
+prot <- mutate(prot, GeneID = as.character(GeneID))
+donor <- topTable(efit, coef = "donor", number = Inf)
+donorDisplay <- signif(donor, 2)
+donorDisplay <- mutate(donorDisplay, 
+                       GeneID = str_sub(rownames(donorDisplay), start = 2), .before = 1) %>% 
+  left_join(prot, by = "GeneID") %>% 
+  dplyr::select(GeneID, Symbol, chromosome, type_of_gene, everything())
+datatable(donorDisplay)
+
+# save table
+# write.csv(donorDisplay, file = "tables/211105_Proteomics_donorLV-RV_DE.csv", row.names = FALSE)
+```
+
+```{r, fig.height=4, fig.width=6}
+dtdf <- data.frame(GeneID = str_sub(rownames(decideTests(efit)), start = 2), decideTests(efit))
+donor <- mutate(donor, GeneID = str_sub(rownames(donor), start = 2), .before = 1) %>% 
+  mutate(logP = -log10(adj.P.Val), ind = (1:nrow(donor)) / nrow(donor)) %>% 
+  left_join(dplyr::select(dtdf, 1:2), by = "GeneID") %>% 
+  left_join(prot, by = "GeneID") %>% 
+  mutate(donor = factor(donor, levels = c(1, -1, 0))) %>% 
+  filter(!is.na(logFC))
+levels(donor$donor) <- c("Up", "Down", "Not significant")
+ggplot(donor, aes(x = logFC, y = -log10(adj.P.Val), color = donor)) + 
+  geom_point() + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", size = 0.4) + 
+  geom_text_repel(data = filter(donor, -log10(adj.P.Val) > 7 | logFC < -5), 
+            aes(label = Symbol, fontface = 2), size = 2.9) + 
+  theme_bw() +
+  scale_color_manual(values = brewer.pal(8, "Set2")[c(2:3, 8)]) + 
+  labs(x = "log2FC", y = "-log10(P-value)", color = "DEP") + 
+  ggtitle("Volcano plot")
+```
+
+
+```{r, fig.height=5, fig.width=10}
+donorTop <- dplyr::slice(donor, 1:100)
+donorTopdat <- Anorm[paste("G", donorTop$GeneID, sep = ""), meta$locBank[meta$condition == "Donor"]]
+rownames(donorTopdat) <- donorTop$Symbol
+# donorTopdat <- normalizeBetweenArrays(donorTopdat, method = "cyclicloess")
+# annotate row
+metaTmp <- meta; rownames(metaTmp) <- meta$locBank
+metaTmp <- dplyr::select(metaTmp, condition, sex, location)
+colnames(metaTmp) <- c("Condition", "Gender", "Location")
+metaTmp <- filter(metaTmp, Condition == "Donor") %>% 
+  dplyr::select(Gender, Location)
+# annotate col
+genes <- dplyr::select(donorTop, Symbol, donor) %>% column_to_rownames("Symbol") %>% 
+  dplyr::rename(DEP = donor)
+# annotation colors
+annoColor <- list(Location = locolor, 
+                  Gender = brewer.pal(4, "Pastel2")[1:2], 
+                  DEP = brewer.pal(4, "Set2")[2:3])
+names(annoColor$Location) <- c("LV", "RV")
+names(annoColor$Gender) <- c("F", "M")
+names(annoColor$DEP) <- c("Up", "Down")
+donorHeat <- pheatmap(t(donorTopdat), color = colorRange, fontsize = 8, 
+                      annotation_colors =  annoColor, 
+                      show_rownames = FALSE, annotation_col = genes, 
+                      show_colnames = TRUE, annotation_row = metaTmp, 
+                      fontsize_col = 5, main = "Top 100 DEPs in donor LV vs RV")
+```
+
+For now, proteins annotated are the top 10 significant DEPs. 
+
+
+Network analysis and community detection via walktrap (steps = 10): 
+
+```{r}
+# # save donor DE and protein data with meta data
+# pt <- Anorm
+# pmeta <- meta
+# save(pt, pmeta, donor, file = "211115_protData_meta_and_donorLVRVde.rda")
+
+deProts <- dplyr::slice(donor, 1:200)
+donorData <- Anorm[paste("G", deProts$GeneID, sep = ""), meta$locBank[meta$condition == "Donor"]]
+rownames(donorData) <- deProts$Symbol
+
+# edgeBtwCut is only for edge coloring
+donorknn <- make.knn.graph(donorData, edgeBtwCut = 0.8)
+donorWalktrap <- walktrap.community(donorknn$graph, steps = 10)
+table(donorWalktrap$membership)
+shape.vert <- c("circle", "csquare")[(deProts$logFC >= 0)+1] # up in LV = square, down = circle
+community.list <- lapply(1:max(donorWalktrap$membership), 
+                         function(i) donorWalktrap$names[donorWalktrap$membership == i])
+# colors
+ind <- c(2, 7)
+color.plate <- c(brewer.pal(9, "Purples")[c(5, 7)], brewer.pal(9, "Blues")[c(5, 7)],
+                 brewer.pal(11, "BrBG")[c(8, 10)], pal_material("green")(10)[ind], 
+                 pal_material("lime")(10)[ind], pal_material("yellow")(10)[ind],
+                 pal_material("orange")(10)[c(4, 9)], pal_material("red")(10)[c(2, 5)])
+# scales::show_col(color.plate)
+color.plate <- color.plate[c(seq(1, 16, 2), seq(2, 16, 2))]
+color.plate <- color.plate[unlist(lapply(0:7, function(i) c(1, 9)+i))]
+col.vert <- color.plate[donorWalktrap$membership]
+frame.col.vert <- color.plate[donorWalktrap$membership]
+
+community.col <- GISTools::add.alpha(c(color.plate[1:6], str_sub(color.plate[-c(1:6)], end = -3)), alpha = 0.28)
+
+# adjust vertex sizes
+vertex.sizes <- donorknn$graphdegree*288
+vertex.sizes <- ifelse(vertex.sizes < quantile(vertex.sizes, 0.9), 4, 8)
+
+# add community anno (See end of this file for code)
+# gather community annotations
+comm_anno <- list.files(here("data/forDAVID/DAVID-community/"))
+comm_anno <- lapply(comm_anno, function(i) {
+  read_tsv(here("data/forDAVID/DAVID-community", i), col_types = cols()) %>%
+    mutate(Community = str_sub(i, start = 2, end = -5))
+}) %>% do.call(rbind, .)
+comm_anno <- mutate(comm_anno, Community = as.numeric(Community)) %>%
+  arrange(Community) %>%
+  dplyr::select(Community, everything()) %>%
+  filter(PValue < 0.05)
+# table(comm_anno$Community) # 16 is not annotated
+# filter anno for Community 2 to keep top 8 by P-value
+comm_anno <- filter(comm_anno, !(Community == 2 & PValue >= median(PValue)))
+community.anno <- group_by(comm_anno, Community) %>%
+  summarise(anno = paste0(Term, sep = "", collapse = "; "))
+community.anno <- c(community.anno$anno, "16")
+
+# make genes not annotated hollow
+hasAnno <- paste0(comm_anno$Genes, collapse = ", ", sep = "") %>% str_split(", ")
+hasAnno <- hasAnno[[1]]
+hasAnno <- hasAnno[!duplicated(hasAnno)]
+hasAnno <- prot$Symbol[prot$GeneID %in% hasAnno]
+col.vert[!(donorWalktrap$names %in% hasAnno)] <- "white"
+```
+
+
+```{r}
+# Community PPI score
+ppi <- read_tsv(here("data/forDAVID/210905_donor_community_protein_accession_for_STRING.txt"), col_types = cols())
+ppi <- data.frame(Community = paste("C", 1:max(donorWalktrap$membership), sep = ""), PPIenrichmentPval = as.numeric(ppi[1, 1:max(donorWalktrap$membership)]))
+community.anno[ppi$PPIenrichmentPval < 0.05] <- str_c("**", community.anno[ppi$PPIenrichmentPval < 0.05])
+community.anno[ppi$PPIenrichmentPval < 0.1] <- str_c("*", community.anno[ppi$PPIenrichmentPval < 0.1])
+```
+
+
+```{r, eval=FALSE}
+plot.igraph(donorknn$graph, layout = donorknn$layout, vertex.shape = shape.vert, 
+            vertex.label = V(donorknn$graph)$label, vertex.label.family = "Helvetica", 
+            vertex.label.font = 2, vertex.label.cex = vertex.sizes/12, 
+            vertex.label.color = "black", vertex.color = col.vert, 
+            vertex.size = vertex.sizes*1.2, vertex.frame.color = frame.col.vert, 
+            edge.color = "#808080", edge.width = donorknn$edgeBtw*1.8, 
+            mark.groups = community.list, mark.border = "#ffffff00", mark.col = community.col)
+legend(x = -2.8, y = 1.4, legend = community.anno, col = color.plate, pch = 16, cex = 0.6, bty = "n", pt.cex = 1, y.intersp = 1.5)
+```
+
+![](data/forDAVID/210905-community.png)
+
+
+`***` means a highly significant PPI enrichment score of each community in the STRING database:
+
+```{r}
+datatable(ppi)
+```
+
+A significant P-value means that your proteins have more interactions among themselves than what would be expected for a random set of proteins of similar size, drawn from the genome. Such an enrichment indicates that the proteins are at least partially biologically connected, as a group.
+
+An insignificant P-value means that your current set of proteins is either rather small (i.e. less than 5 proteins or so), or that it is essentially a random collection of proteins that are not very well connected. 
+Note: this does not necessarily mean that it is not a biologically meaningful selection of proteins — it could simply be that these proteins have not been studied very much and that their interactions might not yet be known to STRING.
+
+
+```{r}
+# genes in each cluster
+membership <- data.frame(Symbol = V(donorknn$graph)$label, Membership = donorWalktrap$membership) %>% 
+  arrange(Membership) %>% 
+  left_join(dplyr::select(prot, Symbol, GeneID), by = "Symbol") %>% 
+  dplyr::select(Membership, Symbol, GeneID)
+uniprotAnno <- readxl::read_xlsx(here("data/forDAVID/uniprot-yourlist%3AM20210826F248CABF64506F29A91F8037F07B67D114671E7-filtered-rev--.xlsx"))
+colnames(uniprotAnno)[1:2] <- c("GeneID", "Accession")
+membership <- left_join(membership, dplyr::select(uniprotAnno, GeneID, Accession), by = "GeneID") %>% 
+  left_join(data.frame(Symbol = names(donorknn$graphdegree), 
+                       Degree = signif(scale(donorknn$graphdegree, 
+                                             center = FALSE), 2), 
+                       Neighbourhood.Size = ego_size(donorknn$graph, 
+                                                     order = 1), 
+                       Neighbourhood.Member = sapply(ego(donorknn$graph, order = 1), function(i) paste0(names(i), sep = "", collapse = ", "))), 
+            by = "Symbol") %>% 
+  mutate(Membership = factor(Membership, levels = 1:max(donorWalktrap$membership)))
+
+# results
+datatable(membership, rownames = FALSE, caption = "Node information")
+# write_csv(membership, file = here("data/forDavid/210905_node-information.csv"))
+
+# edge info, edge score in string
+edgeInfo <- data.frame(as_edgelist(donorknn$graph))
+colnames(edgeInfo) <- c("From", "End")
+edgeInfo <- mutate(edgeInfo, Edge.Betweenness = signif(donorknn$edgeBtw, 2)) %>% 
+  left_join(data.frame(From = membership$Symbol, 
+                       From.Membership = membership$Membership), by = "From") %>% 
+  left_join(data.frame(End = membership$Symbol, 
+                       End.Membership = membership$Membership), by = "End") %>% 
+  mutate(Connect.Communities = From.Membership != End.Membership) %>% 
+  mutate(Connect.Communities = ifelse(Connect.Communities, "Yes", "No")) %>% 
+  arrange(From.Membership) %>% 
+  dplyr::select(From, End, From.Membership, End.Membership, Connect.Communities, Edge.Betweenness)
+
+# protein network data (scored links between proteins)
+load(here("data/forDAVID/STRING/210905_stringPPI_edgeScores_in_our_network.rda"))
+edgeInfo <- mutate(edgeInfo, STRING.Edge.Score = edgePPI/1000)
+datatable(edgeInfo, rownames = FALSE, caption = "Edge information, edge scored by STRING v11.5")
+# write_csv(edgeInfo, file = here("data/forDavid/210905_edge-information.csv"))
+```
+
+The edge betweenness centrality is defined as the number of the shortest paths that go through an edge in a graph or network. An edge with a high edge betweenness centrality score represents a bridge-like connector between two parts of a network, and the removal of which may affect the communication between many pairs of nodes through the shortest paths between them. 
+
+PPI confidence combined score are extracted from the STRING protein-protein interaction database. The combined score is computed by combining the probabilities from the different evidence channels and corrected for the probability of randomly observing an interaction. For a more detailed description please see von Mering, et al. Nucleic Acids Res. 2005. 
+
+
+
+
+
+# Gene set over-representation analysis
+
+## KEGG {.tabset .tabset-fade .tabset-pills}
+
+Significant KEGG pathways: 
+
+```{r}
+efit$genes <- prot
+suppressWarnings(k <- kegga(efit, coef = "donor", species = "Hs", geneid = "GeneID", trend = TRUE))
+pathPval(k)
+donor_prot_kegg <- k
+
+# save KEGG results into csv
+# allKEGG <- topKEGG(k, sort = "up", number = Inf)
+# write.csv(allKEGG, file = "tables/211105_Proteomics_donorLV-RV_KEGG.csv")
+```
+
+
+### Up-regulated pathways
+
+```{r}
+donorUp <- topKEGG(k, sort = "up", number = sum(k$P.Up <= 0.05)) %>% 
+  mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2))
+datatable(donorUp)
+```
+
+### Down-regulated pathways
+
+```{r}
+donorDown <- topKEGG(k, sort = "down", number = sum(k$P.Down <= 0.05)) %>% 
+  mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2))
+datatable(donorDown)
+```
+
+
+## Gene ontology {.tabset .tabset-fade .tabset-pills}
+
+```{r}
+go <- goana(efit, coef = "donor", species = "Hs", geneid = "GeneID", 
+           trend = TRUE) %>% suppressWarnings()
+```
+
+### Up-regulated GOs in LV over RV
+
+Significance cut-off: 0.01. 
+
+Biological processes: 
+
+```{r}
+donorUpBP <- topGO(go, ontology = "BP", sort = "up", number = Inf) %>% 
+  mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2)) %>% 
+  filter(P.Up <= 0.01)
+datatable(donorUpBP)
+```
+
+Cellular component:
+
+```{r}
+donorUpCC <- topGO(go, ontology = "CC", sort = "up", number = Inf) %>% 
+  mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2)) %>% 
+  filter(P.Up <= 0.01)
+datatable(donorUpCC)
+```
+
+
+Molecular function: 
+
+```{r}
+donorUpMF <- topGO(go, ontology = "MF", sort = "up", number = Inf) %>% 
+  mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2)) %>% 
+  filter(P.Up <= 0.01)
+datatable(donorUpMF)
+```
+
+
+
+
+### Down-regulated GO in LV
+
+Biological processes: 
+
+```{r}
+donorDownBP <- topGO(go, ontology = "BP", sort = "down", number = Inf) %>% 
+  mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2)) %>% 
+  filter(P.Down <= 0.01)
+datatable(donorDownBP)
+```
+
+
+Cellular component:
+
+```{r}
+donorDownCC <- topGO(go, ontology = "CC", sort = "down", number = Inf) %>% 
+  mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2)) %>% 
+  filter(P.Down <= 0.01)
+datatable(donorDownCC)
+```
+
+
+Molecular function: 
+
+```{r}
+donorDownMF <- topGO(go, ontology = "MF", sort = "down", number = Inf) %>% 
+  mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2)) %>% 
+  filter(P.Down <= 0.01)
+datatable(donorDownMF)
+```
+
+
+
+
+
+```{r, include=FALSE, echo=FALSE}
+# save donor LV vs RV results for the results page
+protDE <- donorDisplay
+protKEGG <- donor_prot_kegg
+protGO <- go
+protNorm <- Anorm
+table(meta$locBank == colnames(Anorm))
+protMeta <- dplyr::select(meta, condition, location, sex, age) %>% 
+  mutate(proxyID = 1:ncol(Anorm)) %>% 
+  dplyr::select(proxyID, everything())
+head(protMeta)
+colnames(protNorm) <- protMeta$proxyID
+protNorm[1:5, 1:5]
+protLVRV <- list(protNorm = protNorm, protMeta = protMeta, 
+          protDE = protDE, protKEGG = protKEGG, 
+          protGO = protGO)
+save(protLVRV, file = here("data/forPage/prot_donorLVRV.rda"))
+
+protDEefit <- efit
+protLVRV <- list(protNorm = protNorm, protMeta = protMeta, 
+          protDE = protDE, protDEefit = protDEefit, 
+          protKEGG = protKEGG, 
+          protGO = protGO)
+save(protLVRV, file = here("data/forPage/211001_prot_donorLVRV.rda"))
+```
+
+
+
+
+
+
+
+
+# Gender effect: Male vs female within each location in donors
+
+```{r}
+sexMeta <- mutate(meta, sexGroup = str_c(group, sex, sep = "_")) %>% 
+  mutate(sexGroup = factor(sexGroup, levels = unique(sexGroup)))
+sexDesign <- model.matrix(~ 0 + sexGroup + log2age, data = sexMeta)
+colnames(sexDesign)[1:12] <- str_sub(colnames(sexDesign)[1:12], start = 9)
+sexContrasts <- makeContrasts(donor_LV_MvsF = Donor_LV_M - Donor_LV_F, 
+                              donor_RV_MvsF = Donor_RV_M - Donor_RV_F, 
+                              levels = sexDesign)
+suppressWarnings(sexdupcor <- duplicateCorrelation(Anorm, sexDesign, block = sexMeta$bank))
+sexCorrelations <- smooth_genewise_cor(Anorm, sexdupcor)
+sexFit <- lmFit2(Anorm, sexDesign, block = sexMeta$bank, correlation = sexCorrelations)
+sexFit <- contrasts.fit(sexFit, contrasts = sexContrasts)
+sexefit <- eBayes(sexFit, robust = TRUE)
+summary(decideTests(sexefit))
+```
+
+
+
+
+## Differentially expressed proteins by location
+
+### LV
+
+Positive logFC means higher expression in male than female. 
+
+```{r}
+genderLV <- topTable(sexefit, coef = "donor_LV_MvsF", number = Inf) %>% signif(2)
+genderLV <- mutate(genderLV, GeneID = str_sub(rownames(genderLV), start = 2), 
+                   .before = 1) %>% 
+    left_join(prot, by = "GeneID") %>% 
+    dplyr::select(GeneID, Symbol, chromosome, type_of_gene, everything())
+datatable(genderLV)
+
+# save
+# write.csv(genderLV, file = "tables/211105_Proteomics_donorLV_MvsF_DE.csv", row.names = FALSE)
+```
+
+
+### RV
+
+Positive logFC means higher expression in male than female. 
+
+```{r}
+genderRV <- topTable(sexefit, coef = "donor_RV_MvsF", number = Inf) %>% signif(2)
+genderRV <- mutate(genderRV, GeneID = str_sub(rownames(genderRV), start = 2), 
+                   .before = 1) %>% 
+    left_join(prot, by = "GeneID") %>% 
+    dplyr::select(GeneID, Symbol, chromosome, type_of_gene, everything())
+datatable(genderRV)
+# save
+# write.csv(genderRV, file = "tables/211105_Proteomics_donor-RV_MvsF_DE.csv", row.names = FALSE)
+```
+
+
+```{r, fig.height=4, fig.width=6}
+genderRVdf <- data.frame(GeneID = str_sub(rownames(decideTests(sexefit)), start = 2), decideTests(sexefit))
+genderRV <- left_join(genderRV, genderRVdf, by = "GeneID") %>% 
+  mutate(donor_RV_MvsF = factor(donor_RV_MvsF, levels = c(1, -1, 0))) %>% 
+  filter(!is.na(donor_RV_MvsF))
+levels(genderRV$donor_RV_MvsF) <- c("Up", "Down", "Not significant")
+ggplot(genderRV, aes(x = logFC, y = -log10(adj.P.Val), color = donor_RV_MvsF)) + 
+  geom_point() + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", size = 0.4) + 
+  geom_text_repel(data = filter(genderRV, -log10(adj.P.Val) > 4), show.legend = FALSE,
+            aes(label = Symbol, fontface = 2), size = 2.9) + 
+  theme_bw() +
+  scale_color_manual(values = brewer.pal(8, "Set2")[c(2:3, 8)]) + 
+  labs(x = "log2FC", y = "-log10(P-value)", color = "DEP") + 
+  ggtitle("Volcano plot")
+```
+
+
+### LogFC in LV vs RV
+
+```{r, fig.height=4, fig.width=6}
+genderdf <- dplyr::select(genderLV, Symbol, logFC, adj.P.Val) %>% 
+  left_join(dplyr::select(genderRV, Symbol, logFC, adj.P.Val), by = "Symbol") %>% 
+  dplyr::rename(LV_logFC = logFC.x, RV_logFC = logFC.y, LV_Pval = adj.P.Val.x, RV_Pval = adj.P.Val.y) %>% 
+  mutate(Significance = ifelse(RV_Pval <= 0.05, "RV", NA)) %>% 
+  mutate(Significance = ifelse(LV_Pval <= 0.05, "LV", Significance)) %>% 
+  mutate(Significance = ifelse(is.na(Significance), "Neither", Significance)) %>% 
+  mutate(Significance = factor(Significance, levels = c("LV", "RV", "Neither")))
+# cor(genderdf$LV_logFC, genderdf$RV_logFC, use = "pairwise.complete.obs")
+
+ggplot(data = filter(genderdf, Significance == "Neither"), aes(x = LV_logFC, y = RV_logFC, color = Significance)) + 
+  geom_hline(yintercept = 0) + 
+  geom_vline(xintercept = 0) + 
+  geom_point(size = 1) +
+  geom_point(data = filter(genderdf, Significance != "Neither"), 
+             aes(x = LV_logFC, y = RV_logFC, color = Significance), size = 1.5) + 
+  geom_abline(slope = 1, intercept = 0, color = "#a6a6a6", linetype = "dashed") + 
+  geom_text_repel(data = filter(genderdf, Significance != "Neither", abs(RV_logFC) > 2.5), 
+                  aes(label = Symbol, fontface = 2), size = 3.2, show.legend = FALSE) + 
+  geom_text_repel(data = filter(genderdf, Significance == "LV"),
+                  aes(label = Symbol, fontface = 2), size = 3.2, show.legend = FALSE) + 
+  annotate("label", x = 3.6, y = -4.8, label = "paste(italic(r) ^ 2, \" = 0.17\")", parse = TRUE) +
+  scale_color_manual(values = c(locolor[1], "#a6a6a6", locolor[2])) + 
+  theme_minimal() +
+  labs(x = "log2FC - LV", y = "log2FC - RV", color = "Significance in")
+```
+
+
+Top 50 proteins at each location: 
+
+```{r, fig.height=4, fig.width=6}
+genderRVsub <- dplyr::slice(genderRV, 1:50)
+genderLVsub <- dplyr::slice(genderLV, 1:50)
+genderRank <- data.frame(Symbol = genderRVsub$Symbol, ranks = 1:nrow(genderRVsub), 
+                         pval = -log10(genderRVsub$adj.P.Val)) %>% 
+  add_row(data.frame(Symbol = genderLVsub$Symbol, ranks = (nrow(genderLVsub):1)+nrow(genderRVsub), pval = log10(genderLVsub$adj.P.Val))) %>% 
+  filter(!is.na(pval)) %>% 
+  mutate(significance = abs(pval) >= -log10(0.05)) %>% 
+  mutate(RV = ifelse(ranks <= nrow(genderRVsub), "RV", "LV")) %>% 
+  mutate(RV = factor(RV, levels = c("RV", "LV")))
+
+ggplot(genderRank, aes(x = ranks, y = pval, size = abs(pval)^2, color = RV, shape = significance)) + 
+  geom_hline(yintercept = 0) + 
+  geom_vline(xintercept = 0) + 
+  geom_point() + 
+  geom_text_repel(data = filter(genderRank, ranks %in% c(1:10, 100)), 
+                  max.overlaps = 8, nudge_x = 8, nudge_y = 0.5, 
+                  aes(label = Symbol, fontface = 2), size = 3.2, show.legend = FALSE) + 
+  scale_shape_manual(values = c(1, 16)) + 
+  scale_size_continuous(breaks = c(1, 4, 8, 16)^2, labels = c(1, 4, 8, 16)) + 
+  scale_color_manual(values = locolor) + 
+  scale_y_continuous(breaks = seq(-5, 15, 5), 
+                     labels = c("-5" = "5", "0" = "0", "5" = "5", "10" = "10", "15" = "15")) +
+  scale_x_continuous(breaks = seq(0, 100, 50), 
+                     labels = NULL ) + 
+  annotate("label", x = 10, y = -0.8, label = "LV Enriched") +
+  annotate("label", x = 10, y = 0.8, label = "RV Enriched") +
+  labs(x = "Protein rank", y = "-log10(P-value)", size = "-log10(P-value)", shape = "Significant?") + 
+  theme_minimal() + 
+  ggtitle("Top 50 DEPs male vs female at each location")
+```
+
+
+
+
+There are interesting DE results in RV samples: 
+
+### Gene set over-representation analysis for RV
+
+#### KEGG {.tabset .tabset-fade .tabset-pills}
+
+```{r, fig.height=2.8}
+sexefit$genes <- prot
+k_gender <- kegga(sexefit, coef = "donor_RV_MvsF", species = "Hs", 
+                  geneid = "GeneID", trend = TRUE) %>% suppressWarnings()
+pathPval(k_gender)
+```
+
+Up-regulated pathways: 
+
+```{r}
+rvUp <- topKEGG(k_gender, sort = "up", 
+                number = sum(k_gender$P.Up <= 0.05)) %>% 
+  mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2))
+datatable(rvUp)
+```
+
+Down-regulated pathways:
+
+```{r}
+rvDown <- topKEGG(k_gender, sort = "down", 
+                  number = sum(k_gender$P.Down <= 0.05)) %>% 
+  mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2))
+datatable(rvDown)
+```
+
+
+
+
+
+
+
+#### Gene ontology terms {.tabset .tabset-fade .tabset-pills}
+
+
+```{r}
+gender_go <- goana(sexefit, coef = "donor_RV_MvsF", species = "Hs", 
+                   geneid = "GeneID", trend = TRUE) %>% suppressWarnings()
+```
+
+##### Up-regulated GOs in LV over RV {.tabset .tabset-fade .tabset-pills}
+
+Significance cut-off: 0.01. 
+
+Biological processes: 
+
+```{r}
+genderUpBP <- topGO(gender_go, ontology = "BP", sort = "up", number = Inf) %>% 
+  mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2)) %>% 
+  filter(P.Up <= 0.01)
+datatable(genderUpBP)
+```
+
+Cellular component:
+
+```{r}
+genderUpCC <- topGO(gender_go, ontology = "CC", sort = "up", number = Inf) %>% 
+  mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2)) %>% 
+  filter(P.Up <= 0.01)
+datatable(genderUpCC)
+```
+
+
+Molecular function: 
+
+```{r}
+genderUpMF <- topGO(gender_go, ontology = "MF", sort = "up", number = Inf) %>% 
+  mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2)) %>% 
+  filter(P.Up <= 0.01)
+datatable(genderUpMF)
+```
+
+
+##### Down-regulated GO in LV {.tabset .tabset-fade .tabset-pills}
+
+Biological processes: 
+
+```{r}
+genderDownBP <- topGO(gender_go, ontology = "BP", sort = "down", number = Inf) %>% 
+  mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2)) %>% 
+  filter(P.Down <= 0.01)
+datatable(genderDownBP)
+```
+
+
+Cellular component:
+
+```{r}
+genderDownCC <- topGO(gender_go, ontology = "CC", sort = "down", number = Inf) %>% 
+  mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2)) %>% 
+  filter(P.Down <= 0.01)
+datatable(genderDownCC)
+```
+
+
+Molecular function: 
+
+```{r}
+genderDownMF <- topGO(gender_go, ontology = "MF", sort = "down", number = Inf) %>% 
+  mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2)) %>% 
+  filter(P.Down <= 0.01)
+datatable(genderDownMF)
+```
+
+
+
+```{r, include=FALSE, echo=FALSE}
+# save donor LV vs RV results for the results page
+protSexDE <- sexefit
+protSexKEGG <- k_gender
+protSexGO <- gender_go
+protSex <- list(protSexDE = protSexDE, protSexKEGG = protSexKEGG, 
+                protSexGO = protSexGO)
+save(protSex, file = here("data/forPage/prot_gender.rda"))
+```
+
+
+
+
+# Metablomics data
+
+We analysed the overlapped metabolites in the two batches after some QC, resulting data size is 126 samples and 100 metabolites, where 94 of them had KEGG compound IDs. These KEGG compound IDs are then used to perform pathway enrichment analysis by the mean-rank gene set test using t-statistics. 
+
+```{r}
+load("data/210904_18and20integrated_metabolite_CLEAN.rda")
+# subject info
+subj_mtb <- filter(mtb_meta, !duplicated(bank))
+# add condition
+mtb_meta <- left_join(mtb_meta, dplyr::select(subj, bank, condition), by = "bank")
+mtb_meta[which(mtb_meta$bank == "3.153"), c(7:9, 11)] <- c("M", 43, NA, "DCM")
+mtb_meta <- mutate(mtb_meta, age = as.numeric(age))
+mtb_meta[mtb_meta$bank == "3.075", "age"] <- 43
+```
+
+```{r}
+outlier <- c("LV_3.029_64", "LV_3.133_74", "LV_5.128_9", "LV_6.034_51", "LV_6.034_170", "LV_4.021_110", "LV_3.153_161")
+mtb <- t(mtb[, !(colnames(mtb) %in% outlier)])
+mtb_meta <- filter(mtb_meta, !(sample %in% outlier))
+
+
+# for write raw meta file later 
+dim(mtb_meta)
+raw_mtb_meta_for_output <- dplyr::select(mtb_meta, sample, year, condition, location)
+
+mtbvar <- Rfast::colVars(mtb)
+ctl <- mtbvar <= median(mtbvar, na.rm = TRUE) & !is.na(mtbvar)
+# table(ctl)
+M <- replicate.matrix(mtb_meta$locBank)
+# dim(M)
+rownames(M) <- rownames(mtb)
+# table(colSums(M))
+mtbnorm <- ruvms(mtb, M, ctl)
+# dim(mtbnorm)
+```
+
+
+
+## Subject information
+
+
+```{r, fig.width=20, fig.height=5}
+subj_mtb <- dplyr::select(mtb_meta, bank, year, condition, age, sex, diabetes) %>% distinct()
+dups <- filter(subj_mtb, bank %in% bank[duplicated(bank)], year == "2018") %>% mutate(year = "Crossover")
+uniques <- filter(subj_mtb, !duplicated(bank)) %>% mutate(year = "Merged")
+subj_mtb <- add_row(subj_mtb, dups) %>% add_row(uniques) %>% 
+  mutate(year = factor(year, levels = c("Merged", "Crossover", "2020", "2018")))
+subjSummary <- ggplot(subj_mtb, aes(x = condition, y = year, color = condition)) + 
+  geom_count(alpha = 0.8) + 
+  scale_size_continuous(range = c(2, 20)) +
+  scale_color_manual(values = brewer.pal(6, "Dark2")) + 
+  theme_pubclean()
+subjSummary <- subjSummary + 
+  geom_text(data = ggplot_build(subjSummary)$data[[1]], 
+            aes(x = x, y = y, label = n, size = n/12), fontface = 2, color = "black") + 
+  guides(size = "none", color = "none") + 
+  labs(x = "Condition", y = "Year", color = "Condition") + 
+  ggtitle("Individual hearts")
+
+subj_mtb <- filter(subj_mtb, year %in% c("2018", "2020")) %>% 
+  mutate(year = factor(year, levels = c("2018", "2020"))) %>% 
+  filter(!duplicated(bank))
+median_age <- group_by(subj_mtb, condition) %>% summarise(med = median(age))
+age <- ggplot(subj_mtb, aes(x = condition, y = age, fill = condition)) + 
+  geom_boxplot(alpha = 0.8) + 
+  scale_fill_manual(values = brewer.pal(6, "Dark2")) + 
+  geom_text(data = median_age, aes(x = condition, y = med, label = med), size = 5, vjust = -0.5, fontface = 2) + 
+  theme_bw() + 
+  labs(x = "Condition", y = "Age", fill = "Condition") + 
+  ggtitle("Age")
+sex <- ggplot(subj_mtb, aes(x = condition, fill = sex)) + 
+  geom_bar() + 
+  geom_text(aes(label = ..count..), stat = "count", 
+            position = position_stack(vjust = 0.5), size = 8, fontface = 2) + 
+  scale_fill_manual(values = brewer.pal(3, "Pastel2")) + 
+  theme_bw() + 
+  labs(x = "Condition", y = "Count", fill = "Gender") + 
+  ggtitle("Gender")
+ggarrange(subjSummary, sex, age, nrow = 1)
+```
+
+
+
+
+```{r, include=FALSE, eval=FALSE}
+# Subject crossovers across two data types: 
+library(ggvenn)
+donor_overlap <- list(metab = subj_mtb$bank[subj_mtb$condition == "Donor"], 
+                      prot = subj$bank[subj$condition == "Donor"])
+ggvenn(donor_overlap)
+setdiff(donor_overlap$prot, donor_overlap$metab)
+dcm_overlap <- list(metab = subj_mtb$bank[subj_mtb$condition == "DCM"], 
+                    prot = subj$bank[subj$condition == "DCM"])
+ggvenn(dcm_overlap)
+setdiff(dcm_overlap$prot, dcm_overlap$metab)
+icm_overlap <- list(metab = subj_mtb$bank[subj_mtb$condition == "ICM"], 
+                    prot = subj$bank[subj$condition == "ICM"])
+ggvenn(icm_overlap)
+setdiff(icm_overlap$prot, icm_overlap$metab)
+```
+
+
+
+## Sample summary
+
+```{r, fig.height=2.8, fig.width=8}
+meta_forPlot <- dplyr::select(mtb_meta, sample, condition, location, locBank, year) %>% 
+  mutate(hasrep = c("Singleton", "Replication")[locBank %in% locBank[duplicated(locBank)] + 1]) %>% 
+  mutate(hasrep = str_c(location, hasrep, sep = "~")) %>% 
+  mutate(hasrep = factor(hasrep, levels = c("LV~Singleton", "LV~Replication", "RV~Singleton", "RV~Replication"))) %>% 
+  mutate(condition = factor(condition, levels = c("Donor", "DCM", "ICM")))
+smp1 <- ggplot(meta_forPlot, aes(x = condition, fill = location)) + 
+  geom_bar() + 
+  geom_text(aes(label = ..count..), stat = "count", 
+            position = position_stack(vjust = 0.5), size = 4, fontface = 2) + 
+  scale_fill_manual(values = locolor) + 
+  theme_classic2() + 
+  labs(x = "Condition", y = "Sample count", fill = "Location") + 
+  ggtitle("Merged data")
+smp2 <- ggplot(meta_forPlot, aes(x = condition, fill = location)) + 
+  geom_bar() + 
+  geom_text(aes(label = ..count..), stat = "count", 
+            position = position_stack(vjust = 0.5), size = 4, fontface = 2) + 
+  facet_wrap(~year) + 
+  scale_fill_manual(values = locolor) + 
+  theme_classic2() + 
+  labs(x = "Condition", y = "Sample count", fill = "Location") + 
+  ggtitle("Sample summary of the two batches")
+ggarrange(smp1, smp2, widths = c(1, 2))
+```
+
+
+```{r, fig.height=1.8, fig.width=20}
+meta_forTile <- dplyr::select(mtb_meta, locBank, condition, location, year) %>% 
+  mutate(tmp = paste(locBank, year, sep = "_")) %>% 
+  dplyr::mutate(withinYear = ifelse(tmp %in% tmp[duplicated(tmp)], "*", NA)) %>%
+  dplyr::select(-tmp) %>% 
+  distinct() %>% 
+  dplyr::mutate(acrossYear = ifelse(locBank %in% locBank[duplicated(locBank)], 
+                                   "^", NA)) %>% 
+  dplyr::select(-year) %>% 
+  filter(!duplicated(locBank)) %>% 
+  mutate(Bank = str_sub(locBank, start = 4)) %>% 
+  mutate(location = factor(location, levels = c("RV", "LV"))) %>% 
+  arrange(condition, Bank) %>% 
+  mutate(Bank = factor(Bank, levels = unique(Bank)))
+
+conditions <- c("Donor", "DCM", "ICM")
+reps <- lapply(1:3, function(i) {
+  ggplot(data = filter(meta_forTile, condition == conditions[i]),
+         aes(x = Bank, y = location, fill = condition)) +
+    geom_tile(color = "white", size = 0.2, alpha = 0.8) +
+    geom_text(aes(label = withinYear), size = 8.8, vjust = 0.9, color = "white",
+              fontface = 2) +
+    geom_text(aes(label = acrossYear), size = 6.8, vjust = 0.2, color = "white") +
+    scale_fill_manual(values = brewer.pal(6, "Dark2")[i]) +
+    theme_classic() +
+    coord_equal() +
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+    labs(x = "Heart ID", y = "Location", fill = "Condition")
+})
+ggplot(meta_forTile, aes(x = Bank, y = location, fill = condition)) +
+    geom_tile(color = "white", size = 0.2, alpha = 0.8) +
+    geom_text(aes(label = withinYear), size = 7, vjust = 0.88, color = "white",
+              fontface = 2) +
+    geom_text(aes(label = acrossYear), size = 4, vjust = 0.28, color = "white") +
+    scale_fill_manual(values = brewer.pal(6, "Dark2")) +
+    theme_classic() +
+    coord_equal() +
+    theme(axis.text.x = element_text(angle = 80, vjust = 0.5, hjust = 0.4, size = 7), 
+          axis.ticks.x = element_blank()) +
+    labs(x = "Heart ID", y = "Location", fill = "Condition")
+```
+
+where * = has a within batch replication, ^ = has a cross batch replication. 
+
+
+```{r, fig.width=12, fig.height=5}
+mds <- ggMDS2(mtb, mtb_meta, "raw") %>% add_row(ggMDS2(mtbnorm, mtb_meta, "normalised")) %>% 
+  mutate(label = factor(label, levels = c("raw", "normalised"))) %>% 
+  mutate(yearLoc = str_c(year, location, sep = "~"))
+
+repStr <- dplyr::select(mtb_meta, sample, locBank, from18, year)
+corssyear <- filter(repStr, from18 == "Yes")$locBank
+repStr <- mutate(repStr, hascrossyear = ifelse(locBank %in% corssyear, "Yes", NA)) %>% 
+  mutate(annotext = as.numeric(as.factor(ifelse(hascrossyear == "Yes", locBank, NA)))) %>% 
+  dplyr::select(sample, annotext)
+
+mds <- left_join(mds, repStr, by = "sample")
+
+ggplot(mds, aes(x = x, y = y, color = year, shape = location)) + 
+  geom_point(size = 4.8, alpha = 0.8, stroke = 0.8) + 
+  geom_text(aes(label = annotext), color = "black", fontface = 2, size = 2.4) + 
+  facet_wrap(~ label, ncol = 2, scales = "free") + 
+  theme_classic2() + 
+  scale_shape_manual(values = c(16, 8)) + 
+  scale_color_manual(values = brewer.pal(4, "Set2")[2:3]) + 
+  labs(x = "Leading logFC dim 1", y = "Leading logFC dim 2", 
+       color = "Year", shape = "Location")
+```
+
+
+Highlight donor samples: 
+
+```{r, fig.height=4, fig.width=5.8}
+mdsNorm <- filter(mds, label == "normalised")
+ggplot() + 
+  geom_point(data = add_row(filter(mdsNorm, condition != "Donor"), 
+                            filter(mdsNorm, condition == "Donor")), 
+             aes(x = x, y = y, color = condition, shape = location), 
+             size = 2, alpha = 0.8, stroke = 0.8) + 
+  theme_classic2() + 
+  scale_shape_manual(values = c(16, 8)) + 
+  scale_color_manual(values = c(brewer.pal(8, "Dark2")[1], 
+                                brewer.pal(8, "Greys")[4], 
+                                brewer.pal(8, "Greys")[4], 
+                                brewer.pal(8, "Greys")[4])) + 
+  labs(x = "Leading logFC dim 1", y = "Leading logFC dim 2", 
+       color = "Condition", shape = "Location")
+```
+
+
+Also provide RLA plot as a diagnostic for effective normalisation: 
+
+```{r, fig.width=16, fig.height=6}
+par(mfrow = c(1, 2))
+RLA(mtb, repCol = brewer.pal(4, "Set2")[2:3][as.numeric(as.factor(mtb_meta$year))], repLabel = c("2018", "2020"), title = "Raw", ylim = c(-1.1, 2.2))
+RLA(mtbnorm, repCol = brewer.pal(4, "Set2")[2:3][as.numeric(as.factor(mtb_meta$year))], repLabel = c("2018", "2020"), title = "Merged", ylim = c(-1.1, 2.2))
+```
+
+
+
+# Differential analysis in metabolites
+
+```{r}
+M <- replicate.matrix(mtb_meta$locBank)
+M_metab_output <- M
+# dim(M)
+mtb_meta <- filter(mtb_meta, !duplicated(locBank))
+# dim(mtb_meta)
+mtbAnorm <- do.call(rbind, lapply(1:ncol(M), function(i) colMeans(mtbnorm[M[, i] == 1, , drop = FALSE], na.rm = TRUE)))
+rownames(mtbAnorm) <- colnames(M)
+mtbAnorm <- mtbAnorm[mtb_meta$locBank, ]
+mtbAnorm[is.nan(mtbAnorm)] <- NA
+
+# NA%
+dim(mtbAnorm)
+sum(is.na(mtbAnorm)) / length(mtbAnorm)
+```
+
+
+## Design and contrasts
+
+We are interested in whether there are any differentially expression in donors between the left and the right ventricle tissue samples. Design is constructed to adjust for log2 age and gender. 
+
+```{r}
+mtb_meta <- mutate(mtb_meta, group = paste(condition, location, sep = "_")) %>% 
+  mutate(log2age = log2(age))
+design <- model.matrix(~ 0 + group + log2age + sex, data = mtb_meta)
+colnames(design)[1:6] <- str_sub(colnames(design)[1:6], start = 6)
+contrasts <- makeContrasts(donor = Donor_LV - Donor_RV, levels = design)
+```
+
+
+```{r, include = FALSE}
+dim(raw_mtb_meta_for_output)
+dim(M_metab_output)
+dim(mtbAnorm)
+
+raw_mtb_meta_for_output <- mutate(raw_mtb_meta_for_output, raw_sample_id = paste("Raw_SmpID", 1:nrow(M_metab_output), sep = "_"), .before = year)
+rownames(M_metab_output) <- raw_mtb_meta_for_output$raw_sample_id
+
+smp_orders_metab <- data.frame(locBank = colnames(M_metab_output))
+
+
+# save metab data and meta data
+metab_data <- t(mtbAnorm)
+dim(metab_data)
+dim(mtb_meta)
+mtb_meta <- dplyr::select(mtb_meta, locBank, condition, location) %>% 
+  mutate(sample = paste("Sample", 1:82, sep = ""), .before = 1)
+table(mtb_meta$locBank == colnames(metab_data))
+colnames(metab_data) <- mtb_meta$sample
+
+smp_orders_metab <- left_join(smp_orders_metab, mtb_meta, by = "locBank")
+head(smp_orders_metab)
+table(colnames(M_metab_output) == smp_orders_metab$locBank)
+colnames(M_metab_output) <- smp_orders_metab$sample
+# write.csv(M_metab_output, file = "tables/230317-Metabolite_metadata_RawSampleID_to_MergedID.csv")
+
+mtb_meta <- dplyr::select(mtb_meta, -locBank)
+head(mtb_meta)
+metab_data[1:5, 1:5]
+
+raw_mtb_meta_for_output_complete <- raw_mtb_meta_for_output
+raw_mtb_meta_for_output <- dplyr::select(raw_mtb_meta_for_output, raw_sample_id, year, condition, location)
+# write.csv(raw_mtb_meta_for_output, file = "tables/230317-metabolite_RawMeta.csv")
+# write.csv(raw_mtb_meta_for_output_complete, file = "tables/230318-metabolite_RawMeta_nonAnonymized.csv")
+
+# # write normalised proteomics data
+# write.csv(metab_data, file = "tables/metabolite_data_normalised.csv")
+# write.csv(mtb_meta, file = "tables/metabolite_metadata.csv")
+
+# save metabolite data, meta data and donor DE table for networks
+mt <- t(mtbAnorm)
+mtmeta <- mtb_meta
+mtdonor <- donorDisplay
+# save(mt, mtmeta, mtdonor, file = "211115_pmetabData_meta_and_donorLVRVde.rda")
+```
+
+
+## Differential expression summary
+
+Positive FC means higher expression in LV over RV.
+
+```{r}
+mtbAnorm <- t(mtbAnorm)
+suppressWarnings(dupcor <- duplicateCorrelation(mtbAnorm, design, block = mtb_meta$bank))
+correlations <- smooth_genewise_cor(mtbAnorm, dupcor)
+fit <- lmFit2(mtbAnorm, design, block = mtb_meta$bank, correlation = correlations)
+fit <- contrasts.fit(fit, contrasts = contrasts)
+efit <- eBayes(fit)
+summary(decideTests(efit))
+```
+
+
+## Differentially abundant metabolites
+
+```{r}
+donor <- topTable(efit, coef = "donor", number = Inf)
+donorDisplay <- signif(donor, 2)
+donorDisplay <- mutate(donorDisplay, name = rownames(donorDisplay), .before = 1) %>% 
+  left_join(mtb_anno, by = "name") %>% 
+  column_to_rownames("name") %>% 
+  dplyr::select(KEGG, HMDB, everything())
+datatable(donorDisplay)
+
+# save
+# write.csv(donorDisplay, file = "tables/211105_Metabolomics_donor_LV-RV_DE.csv")
+```
+
+```{r, fig.height=4, fig.width=6}
+dtdf <- as.data.frame(decideTests(efit)) %>% rownames_to_column(var = "name")
+donor <- mutate(donor, name = rownames(donor), .before = 1) %>% 
+  mutate(logP = -log10(adj.P.Val), ind = (1:nrow(donor)) / nrow(donor)) %>% 
+  left_join(dtdf, by = "name") %>% 
+  left_join(mtb_anno, by = "name") %>% 
+  mutate(donor = factor(donor, levels = c(1, -1, 0))) %>% 
+  filter(!is.na(logFC))
+levels(donor$donor) <- c("Up", "Down", "Not significant")
+ggplot(donor, aes(x = logFC, y = -log10(adj.P.Val), color = donor)) + 
+  geom_point() + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", size = 0.4) + 
+  geom_text_repel(data = filter(donor, -log10(adj.P.Val) > 2), 
+            aes(label = name, fontface = 2), size = 2.9) + 
+  theme_bw() +
+  scale_color_manual(values = brewer.pal(8, "Set2")[c(2:3, 8)]) + 
+  labs(x = "log2FC", y = "-log10(P-value)", color = "DEP") + 
+  ggtitle("Volcano plot")
+```
+ 
+
+```{r, fig.height=4, fig.width=8}
+donorTop <- dplyr::slice(donor, 1:25)
+donorTopdat <- mtbAnorm[donorTop$name, mtb_meta$locBank[mtb_meta$condition == "Donor"]]
+# annotate row
+metaTmp <- mtb_meta; rownames(metaTmp) <- mtb_meta$locBank
+metaTmp <- dplyr::select(metaTmp, condition, sex, location)
+colnames(metaTmp) <- c("Condition", "Gender", "Location")
+metaTmp <- filter(metaTmp, Condition == "Donor") %>% dplyr::select(Gender, Location)
+# annotate col
+metabolites <- dplyr::select(donorTop, name, donor) %>% column_to_rownames("name") %>% 
+  dplyr::rename(DEM = donor)
+# annotation colors
+annoColor <- list(Location = locolor, 
+                  Gender = brewer.pal(4, "Pastel2")[1:2], 
+                  DEM = brewer.pal(4, "Set2")[2:3])
+names(annoColor$Location) <- c("LV", "RV")
+names(annoColor$Gender) <- c("F", "M")
+names(annoColor$DEM) <- c("Up", "Down")
+pheatmap(t(donorTopdat), color = colorRange, fontsize = 8, 
+         annotation_colors =  annoColor, 
+         show_rownames = FALSE, annotation_col = metabolites, 
+         show_colnames = TRUE, annotation_row = metaTmp, 
+         main = "Differentially abundant metabolites in donor LV vs RV")
+```
+
+
+
+
+# Metabolite over-representation analysis (KEGG pathways)
+
+Mean-rank gene set test using t-statistics for metabolites. 
+
+```{r}
+# pathway names
+ref <- keggList("pathway", "hsa")
+keggNames <- data.frame(name = ref) %>% rownames_to_column(var = "Pathway") %>% 
+  mutate(name = str_sub(name, end = -24))
+# cpd to pathway downloaded from http://rest.kegg.jp/link/cpd/pathway
+cpd <- read_tsv(here("data/kegg/210904_kegg_cpd_to_pathway.txt"), col_types = cols(), col_names = FALSE)
+colnames(cpd) <- c("Pathway", "Compound")
+cpd <- mutate(cpd, Pathway = str_replace(Pathway, "map", "hsa"), Compound = str_sub(Compound, start = 5))
+```
+
+## Up-regulated KEGG pathways in donor LV than RV
+
+```{r}
+# up-regulation
+decpds <- dplyr::select(donor, name, KEGG, t, donor, logFC) %>% filter(!is.na(KEGG)) %>% 
+  filter(logFC > 0)
+mtb_rank <- decpds$t; names(mtb_rank) <- decpds$KEGG
+pathway_presence <- lapply(keggNames$Pathway, function(i) {
+  pathi <- filter(cpd, Pathway == i)
+  return(names(mtb_rank) %in% pathi$Compound)
+}) %>% do.call(cbind, .)
+rownames(pathway_presence) <- decpds$KEGG
+mtb_kegg_up <- data.frame(Pathway = keggNames$Pathway, 
+                       P.value = apply(pathway_presence, 2, function (x) geneSetTest(index = x, 
+                                                                                     statistics = mtb_rank)))
+mtb_kegg_up <- mutate(mtb_kegg_up, P.value = signif(P.value, 2)) %>% 
+  arrange(P.value) %>% 
+  left_join(keggNames, by = "Pathway") %>% 
+  dplyr::select(Pathway, name, P.value) %>% 
+  column_to_rownames("Pathway") %>% 
+  dplyr::rename(Pathway = name)
+colnames(mtb_kegg_up)[2] <- "P.up"
+datatable(mtb_kegg_up)
+```
+
+
+Compare with enriched KEGG pathways by proteins: 
+
+```{r}
+kegg_prot <- topKEGG(donor_prot_kegg, sort = "up", number = Inf)
+kegg_prot_up <- rownames(kegg_prot)[kegg_prot$P.Up <= 0.05]
+kegg_mtb_up <- rownames(mtb_kegg_up)[mtb_kegg_up$P.value <= 0.2]
+# intersect(kegg_prot_up, kegg_mtb_up)
+```
+
+There is no common pathway at the significance level of 0.05. But the Top 2 pathways that are common in both data are 
+
+```{r}
+(top2 <- filter(keggNames, Pathway %in% intersect(kegg_mtb_up, kegg_prot_up)))
+```
+
+Their pathway enrichment P-values in proteins:
+
+```{r}
+(top2_inProt <- kegg_prot[top2$Pathway, ] %>% 
+  mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2)))
+```
+
+Their pathway enrichment P-values in metabolites:
+
+```{r}
+(top2_inMtb <- mtb_kegg_up[top2$Pathway, ] %>% 
+  mutate(P.value = signif(P.value, 2)))
+```
+
+
+
+## Down-regulated KEGG pathways in donor LV than RV
+
+```{r}
+decpds <- dplyr::select(donor, name, KEGG, t, donor, logFC) %>% filter(!is.na(KEGG)) %>% 
+  filter(logFC < 0)
+mtb_rank <- decpds$t; names(mtb_rank) <- decpds$KEGG
+pathway_presence <- lapply(keggNames$Pathway, function(i) {
+  pathi <- filter(cpd, Pathway == i)
+  return(names(mtb_rank) %in% pathi$Compound)
+}) %>% do.call(cbind, .)
+rownames(pathway_presence) <- decpds$KEGG
+mtb_kegg_down <- data.frame(Pathway = keggNames$Pathway, 
+                       P.value = apply(pathway_presence, 2, function (x) geneSetTest(index = x, 
+                                                                                     statistics = mtb_rank)))
+mtb_kegg_down <- mutate(mtb_kegg_down, P.value = signif(P.value, 2)) %>% 
+  arrange(P.value) %>% 
+  left_join(keggNames, by = "Pathway") %>% 
+  dplyr::select(Pathway, name, P.value) %>% 
+  column_to_rownames("Pathway") %>% 
+  dplyr::rename(Pathway = name)
+colnames(mtb_kegg_down)[2] <- "P.down"
+datatable(mtb_kegg_down)
+
+mtb_kegg_up <- rownames_to_column(mtb_kegg_up, "PathwayID")
+mtb_kegg_down <- rownames_to_column(mtb_kegg_down, "PathwayID") %>% dplyr::select(-Pathway)
+mtb_kegg <- left_join(mtb_kegg_up, mtb_kegg_down, by = "PathwayID")
+# save
+# write.csv(mtb_kegg, file = "tables/211105_Metabolomics_donorLV-RV_KEGG.csv")
+```
+
+
+```{r, fig.height=2.8}
+mtb_kegg <- dplyr::rename(mtb_kegg_up, P.Up = P.value) %>% 
+  left_join(mtb_kegg_down, by = "Pathway") %>% 
+  dplyr::rename(P.Down = P.value)
+pathPval2(mtb_kegg)
+```
+
+
+
+Compare with enriched KEGG pathways by proteins: 
+
+```{r}
+kegg_prot_down <- rownames(kegg_prot)[kegg_prot$P.Down <= 0.05]
+kegg_mtb_down <- rownames(mtb_kegg_down)[mtb_kegg_down$P.value <= 0.2]
+# intersect(kegg_prot_down, kegg_mtb_down)
+```
+
+There is no common pathway at the significance level of 0.05. But the Top 1 pathway that are common in both data are 
+
+```{r}
+(top1 <- filter(keggNames, Pathway %in% intersect(kegg_prot_down, kegg_mtb_down)))
+```
+
+The pathway enrichment P-values in proteins:
+
+```{r}
+(top1_inProt <- kegg_prot[top1$Pathway, ] %>% 
+  mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2)))
+```
+
+The pathway enrichment P-values in metabolites:
+
+```{r}
+(top1_inMtb <- mtb_kegg_down[top1$Pathway, ] %>% 
+  mutate(P.value = signif(P.value, 2)))
+```
+
+
+## Overlap in pathways in top 20
+
+- Up-regulated
+
+```{r}
+keggUp_overlap <- list(prot = rownames(kegg_prot)[1:25], 
+                       metab = rownames(mtb_kegg_up)[1:25])
+upOverlap_id <- intersect(keggUp_overlap$prot, keggUp_overlap$metab)
+filter(kegg_prot, rownames(kegg_prot) %in% upOverlap_id)
+
+kegg_prot_donw_tmp <- arrange(kegg_prot, P.Down)
+keggDown_overlap <- list(prot = rownames(kegg_prot_donw_tmp)[1:25], 
+                         metab = rownames(mtb_kegg_down)[1:25])
+downOverlap_id <- intersect(keggDown_overlap$prot, keggDown_overlap$metab)
+filter(kegg_prot, rownames(kegg_prot) %in% downOverlap_id)
+```
+
+```{r, eval=FALSE, include=FALSE}
+library(ggvenn)
+ggvenn(keggUp_overlap)
+ggvenn(keggDown_overlap)
+```
+
+
+
+```{r, include=FALSE, echo=FALSE}
+# save donor LV vs RV results for the results page
+metabDE <- donorDisplay
+metabKEGG <- mtb_kegg
+metabNorm <- mtbAnorm
+table(mtb_meta$locBank == colnames(metabNorm))
+metabMeta <- dplyr::select(mtb_meta, condition, location, sex, age) %>% 
+  mutate(proxyID = 1:ncol(metabNorm)) %>% 
+  dplyr::select(proxyID, everything())
+head(metabMeta)
+colnames(metabNorm) <- metabMeta$proxyID
+metabNorm[1:5, 1:5]
+dim(metabNorm)
+metabLVRV <- list(metabNorm = metabNorm, 
+                  metabMeta = metabMeta, 
+                  metabDE = metabDE, 
+                  metabKEGG = metabKEGG)
+save(metabLVRV, file = here("data/forPage/metabLVRV.rda"))
+
+metabDEefit <- efit
+metabLVRV <- list(metabNorm = metabNorm, 
+                  metabMeta = metabMeta, 
+                  metabDE = metabDE, 
+                  metabDEefit = metabDEefit, 
+                  metab_anno = mtb_anno, 
+                  metabKEGG = metabKEGG)
+save(metabLVRV, file = here("data/forPage/211001_metab_donorLVRV.rda"))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Gender difference in metabolites
+
+Male vs female within each location in donors
+
+```{r}
+sexMeta <- mutate(mtb_meta, sexGroup = str_c(group, sex, sep = "_")) %>% 
+  mutate(sexGroup = factor(sexGroup, levels = unique(sexGroup)))
+sexDesign <- model.matrix(~ 0 + sexGroup + log2age, data = sexMeta)
+colnames(sexDesign)[1:12] <- str_sub(colnames(sexDesign)[1:12], start = 9)
+sexContrasts <- makeContrasts(donor_LV_MvsF = Donor_LV_M - Donor_LV_F, 
+                              donor_RV_MvsF = Donor_RV_M - Donor_RV_F, 
+                              levels = sexDesign)
+suppressWarnings(sexdupcor <- duplicateCorrelation(mtbAnorm, sexDesign, block = sexMeta$bank))
+sexCorrelations <- smooth_genewise_cor(mtbAnorm, sexdupcor)
+sexFit <- lmFit2(mtbAnorm, sexDesign, block = sexMeta$bank, correlation = sexCorrelations)
+sexFit <- contrasts.fit(sexFit, contrasts = sexContrasts)
+sexefit <- eBayes(sexFit, robust = TRUE)
+summary(decideTests(sexefit))
+```
+
+
+
+
+
+## Gender difference in metabolite abundance in LV
+
+Positive logFC means higher expression in male than female in left ventricular samples. 
+
+```{r}
+genderLV <- topTable(sexefit, coef = "donor_LV_MvsF", number = Inf) %>% signif(2)
+genderLV <- mutate(genderLV, name = rownames(genderLV), .before = 1) %>% 
+  left_join(mtb_anno, by = "name") %>% 
+  column_to_rownames("name") %>% 
+  dplyr::select(KEGG, HMDB, everything())
+datatable(genderLV)
+
+# save
+# write.csv(genderLV, file = "tables/211105_Metabolomics_donor-LV_MvsF_DE.csv")
+```
+
+
+
+```{r, fig.height=4, fig.width=6}
+dtdf <- as.data.frame(decideTests(sexefit)) %>% rownames_to_column(var = "name") %>% dplyr::select(-3)
+donor_LV_MvsF <-  mutate(genderLV, name = rownames(genderLV), .before = 1) %>% 
+  mutate(logP = -log10(adj.P.Val), ind = (1:nrow(donor)) / nrow(donor)) %>% 
+  left_join(dtdf, by = "name") %>% 
+  mutate(donor_LV_MvsF = factor(donor_LV_MvsF, levels = c(1, -1, 0))) %>% 
+  filter(!is.na(logFC))
+levels(donor_LV_MvsF$donor_LV_MvsF) <- c("Up", "Down", "Not significant")
+ggplot(donor_LV_MvsF, aes(x = logFC, y = -log10(adj.P.Val), color = donor_LV_MvsF)) + 
+  geom_point() + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", size = 0.4) + 
+  geom_text_repel(data = filter(donor_LV_MvsF, -log10(adj.P.Val) > -log10(0.05) | logFC < -1), 
+            aes(label = name, fontface = 2), size = 2.9) + 
+  theme_bw() +
+  scale_color_manual(values = brewer.pal(8, "Set2")[c(2:3, 8)]) + 
+  labs(x = "log2FC", y = "-log10(P-value)", color = "DEP") + 
+  ggtitle("Volcano plot")
+```
+
+
+
+
+
+
+
+
+## Gender difference in metabolite abundance in RV
+
+**!** No significant results. 
+
+```{r}
+genderRV <- topTable(sexefit, coef = "donor_RV_MvsF", number = Inf) %>% signif(2)
+genderRV <- mutate(genderRV, name = rownames(genderLV), .before = 1) %>% 
+    left_join(mtb_anno, by = "name") %>% 
+    dplyr::select(KEGG, HMDB, everything())
+datatable(genderRV)
+# save
+# write.csv(genderRV, file = "tables/211105_Metabolomics_donor-RV_MvsF_DE.csv")
+```
+
+
+## Compare LV to RV
+
+```{r, fig.height=4, fig.width=6}
+genderdf <- dplyr::select(rownames_to_column(genderLV, "name"), name, KEGG, logFC, adj.P.Val) %>% 
+  left_join(dplyr::select(genderRV, name, logFC, adj.P.Val), by = "name") %>% 
+  dplyr::rename(LV_logFC = logFC.x, RV_logFC = logFC.y, LV_Pval = adj.P.Val.x, RV_Pval = adj.P.Val.y) %>% 
+  mutate(Significance = ifelse(RV_Pval <= 0.05, "RV", NA)) %>% 
+  mutate(Significance = ifelse(LV_Pval <= 0.05, "LV", Significance)) %>% 
+  mutate(Significance = ifelse(is.na(Significance), "Neither", Significance)) %>% 
+  mutate(Significance = factor(Significance, levels = c("LV", "RV", "Neither")))
+# cor(genderdf$LV_logFC, genderdf$RV_logFC, use = "pairwise.complete.obs")
+
+ggplot(data = filter(genderdf, Significance == "Neither"), aes(x = LV_logFC, y = RV_logFC, color = Significance)) + 
+  geom_hline(yintercept = 0) + 
+  geom_vline(xintercept = 0) + 
+  geom_point(size = 1) +
+  geom_point(data = filter(genderdf, Significance != "Neither"), 
+             aes(x = LV_logFC, y = RV_logFC, color = Significance), size = 1.5) + 
+  geom_abline(slope = 1, intercept = 0, color = "#a6a6a6", linetype = "dashed") +  
+  geom_text_repel(data = filter(genderdf, Significance == "LV"),
+                  aes(label = name, fontface = 2), size = 4, show.legend = FALSE) + 
+  annotate("label", x = 1, y = -1.5, label = "paste(italic(r) ^ 2, \" = 0.07\")", parse = TRUE) +
+  scale_color_manual(values = c(locolor[1], "#a6a6a6", locolor[2])) + 
+  theme_minimal() +
+  labs(x = "log2FC - LV", y = "log2FC - RV", color = "Significance in")
+```
+
+
+```{r, fig.height=4, fig.width=6}
+genderRVsub <- genderRV; genderLVsub <- rownames_to_column(genderLV, "name")
+genderRank <- data.frame(name = genderRVsub$name, ranks = 1:nrow(genderRVsub), 
+                         pval = -log10(genderRVsub$adj.P.Val)) %>% 
+  add_row(data.frame(name = genderLVsub$name, ranks = (nrow(genderLVsub):1)+nrow(genderRVsub), 
+                     pval = log10(genderLVsub$adj.P.Val))) %>% 
+  mutate(significance = abs(pval) >= -log10(0.05)) %>% 
+  mutate(RV = ifelse(ranks <= nrow(genderRVsub), "RV", "LV")) %>% 
+  mutate(RV = factor(RV, levels = c("RV", "LV")))
+
+ggplot(genderRank, aes(x = ranks, y = pval, size = abs(pval), color = RV, fill = RV, shape = significance)) + 
+  geom_hline(yintercept = 0) + 
+  geom_vline(xintercept = 0) + 
+  geom_point() + 
+  geom_text_repel(data = filter(genderRank, significance == TRUE), 
+                  max.overlaps = 8, nudge_x = 8, nudge_y = 0.5, 
+                  aes(label = name, fontface = 2), size = 3.2, show.legend = FALSE) + 
+  scale_shape_manual(values = c(1, 16)) + 
+  scale_size_continuous(breaks = seq(1, 3, 0.5), labels = seq(1, 3, 0.5)) + 
+  scale_color_manual(values = locolor) + 
+  scale_x_continuous(breaks = seq(0, 200, 100), labels = NULL) + 
+  scale_y_continuous(breaks = seq(-2, 1, 1), 
+                     labels = abs(seq(-2, 1, 1))) +
+  annotate("label", x = 20, y = -2.4, label = "LV Enriched") +
+  annotate("label", x = 20, y = 1, label = "RV Enriched") +
+  labs(x = "Metabolite rank", y = "-log10(P-value)", size = "-log10(P-value)", shape = "Significant?") + 
+  theme_minimal()
+```
+
+
+
+
+## Pathway enrichment in LV
+
+### Up-regulated
+
+```{r}
+decpds_LV_up <- dplyr::select(donor_LV_MvsF, name, KEGG, t, logFC, donor_LV_MvsF) %>% filter(!is.na(KEGG)) %>% 
+  filter(logFC > 0)
+mtb_rank <- decpds_LV_up$t; names(mtb_rank) <- decpds_LV_up$KEGG
+pathway_presence <- lapply(keggNames$Pathway, function(i) {
+  pathi <- filter(cpd, Pathway == i)
+  return(names(mtb_rank) %in% pathi$Compound)
+}) %>% do.call(cbind, .)
+rownames(pathway_presence) <- decpds_LV_up$KEGG
+LV_mtb_kegg_up <- data.frame(Pathway = keggNames$Pathway, 
+                          P.value = apply(pathway_presence, 2, function (x) geneSetTest(index = x, 
+                                                                                        statistics = mtb_rank)))
+LV_mtb_kegg_up <- mutate(LV_mtb_kegg_up, P.value = signif(P.value, 2)) %>% 
+  arrange(P.value) %>% 
+  left_join(keggNames, by = "Pathway") %>% 
+  dplyr::select(Pathway, name, P.value) %>% 
+  column_to_rownames("Pathway") %>% 
+  dplyr::rename(Pathway = name)
+datatable(LV_mtb_kegg_up)
+```
+
+
+### Down-regulated
+
+```{r}
+decpds_LV_down <- dplyr::select(donor_LV_MvsF, name, KEGG, t, logFC, donor_LV_MvsF) %>% filter(!is.na(KEGG)) %>% 
+  filter(logFC < 0)
+mtb_rank <- decpds_LV_down$t; names(mtb_rank) <- decpds_LV_down$KEGG
+pathway_presence <- lapply(keggNames$Pathway, function(i) {
+  pathi <- filter(cpd, Pathway == i)
+  return(names(mtb_rank) %in% pathi$Compound)
+}) %>% do.call(cbind, .)
+rownames(pathway_presence) <- decpds_LV_down$KEGG
+LV_mtb_kegg_down <- data.frame(Pathway = keggNames$Pathway, 
+                          P.value = apply(pathway_presence, 2, function (x) geneSetTest(index = x, 
+                                                                                        statistics = mtb_rank)))
+LV_mtb_kegg_down <- mutate(LV_mtb_kegg_down, P.value = signif(P.value, 2)) %>% 
+  arrange(P.value) %>% 
+  left_join(keggNames, by = "Pathway") %>% 
+  dplyr::select(Pathway, name, P.value) %>% 
+  column_to_rownames("Pathway") %>% 
+  dplyr::rename(Pathway = name)
+datatable(LV_mtb_kegg_down)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<br><br><br><br>
+<br><br><br><br>
+
+
+# Session information
+
+```{r}
+sessioninfo::session_info()
+```
+
+
+```{r, eval=FALSE, include=FALSE}
+# write gene list for DAVID
+donor_community <- lapply(1:max(donorWalktrap$membership), function(i) {
+  filter(membership, Membership == i)$GeneID
+}) %>% do.call(qpcR:::cbind.na, .)
+colnames(donor_community) <- paste0("C", 1:max(donorWalktrap$membership))
+write.table(donor_community, quote = FALSE, row.names = FALSE, na = "", sep = "\t",
+            file = here("data/forDAVID/210905_donor_community.txt"))
+
+# write accession for STRING PPI
+donor_community <- lapply(1:max(donorWalktrap$membership), function(i) {
+  filter(membership, Membership == i)$Accession
+}) %>% do.call(qpcR:::cbind.na, .)
+colnames(donor_community) <- paste0("C", 1:max(donorWalktrap$membership))
+write.table(donor_community, quote = FALSE, row.names = FALSE, na = "", sep = "\t",
+            file = here("data/forDAVID/210905_donor_community_protein_accession_for_STRING.txt"))
+
+# get PPI edge scores
+ppi_prot <- read_table(here("data/forDAVID/STRING/9606.protein.info.v11.5.txt"), col_types = cols())
+# filter by nodes in network
+ppi_prot <- filter(ppi_prot, preferred_name %in% membership$Symbol)
+# get edge scores
+ppi_edge <- read_table(here("data/forDAVID/STRING/9606.protein.links.v11.5.txt"), col_types = cols())
+edgePPI <- lapply(1:nrow(edgeInfo), function(i) {
+  from <- ppi_prot$`#string_protein_id`[ppi_prot$preferred_name == edgeInfo$From[i]]
+  to <- ppi_prot$`#string_protein_id`[ppi_prot$preferred_name == edgeInfo$End[i]]
+  if (length(from) == 0 | length(to) == 0) return(NA) else {
+    res <- filter(ppi_edge, protein1 == from, protein2 == to)
+  }
+  if (nrow(filter(ppi_edge, protein1 == from, protein2 == to)) == 0) return(NA) else
+    return(res$combined_score)
+}) %>% unlist()
+save(edgePPI, file = here("data/forDAVID/STRING/210905_stringPPI_edgeScores_in_our_network.rda"))
+```
+
+
+```{r, eval=FALSE, include=FALSE}
+decpds <- dplyr::select(donor, name, KEGG, logFC, donor) %>% 
+  filter(!is.na(KEGG))
+cpdkegg <- lapply(keggNames$Pathway, function(pi) {
+  cpds_pi <- filter(cpd, Pathway == pi)
+  # compounds in the pathway
+  N <- length(intersect(cpds_pi$Compound, decpds$KEGG[!is.na(decpds$KEGG)]))
+  if (N > 0) {
+    # up-regulation
+    ups <- filter(decpds, logFC > 0)
+    deups <- filter(decpds, donor == "Up")
+    df <- data.frame(up = ups$KEGG) %>% mutate(inpath = up %in% cpds_pi$Compound, isDE = up %in% deups$KEGG)
+    d_up <- rbind(c(sum(df$inpath & !(df$isDE)), sum(df$inpath & df$isDE)), 
+          c(sum(!(df$inpath) & !(df$isDE)), sum(!(df$inpath) & df$isDE)))
+    Up <- sum(df$inpath)
+    P.Up <- fisher.test(d_up, alternative = "greater")$p
+    # down-regulation
+    downs <- filter(decpds, logFC < 0)
+    dedowns <- filter(decpds, donor == "Down")
+    df <- data.frame(down = downs$KEGG) %>% mutate(inpath = down %in% cpds_pi$Compound, 
+                                                   isDE = down %in% dedowns$KEGG)
+    d_down <- rbind(c(sum(df$inpath & !(df$isDE)), sum(df$inpath & df$isDE)), 
+          c(sum(!(df$inpath) & !(df$isDE)), sum(!(df$inpath) & df$isDE)))
+    Down <- sum(df$inpath)
+    P.Down <- fisher.test(d_down, alternative = "greater")$p
+    res <- data.frame(Pathway = pi, N = N, Up = Up, Down = Down, P.Up = P.Up, P.Down = P.Down)
+  } else {
+    res <- data.frame(Pathway = NA, N = NA, Up = NA, Down = NA, P.Up = NA, P.Down = NA)
+  }
+  res
+}) %>% do.call(rbind, .)
+cpdkegg <- filter(cpdkegg, !is.na(N))
+```
+

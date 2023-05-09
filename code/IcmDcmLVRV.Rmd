@@ -1,0 +1,2401 @@
+---
+title: "Molecular differences in LV versus RV in ICM and DCM in Sydney Heart Bank"
+author: "Mengbo Li"
+date: "`r Sys.Date()`"
+output: 
+   html_document:
+      code_folding: show
+      toc: true
+      toc_float:
+          collapsed: false
+          smooth_scroll: false
+      toc_depth: 3
+      number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r global options, include = FALSE, cache = FALSE}
+options(max.print = "80", digits = 4)
+knitr::opts_chunk$set(echo = FALSE,
+                      cache = FALSE,
+                      prompt = FALSE,
+                      tidy = TRUE,
+                      comment = NA,
+                      message = FALSE,
+                      warning = FALSE, 
+                      fig.align = "center")
+```
+
+
+
+# Summary
+
+In this file, the following analyses are presented: 
+
+A. Differential expression analysis to compare LV and RV samples in both heart failures, while adjusted for (log2) age, sex and diabetes. Differential expression results in each HF is then compared with those differentially expressed between chambers in donor hearts. KEGG pathway analysis is also performed and compared.  This is done for both proteomics and metabolomics data. 
+
+B. As a follow-up to Analysis (A), I also compare the pathway results from proteomics data with those of metabolomics data in each HF. This is to see if there is any KEGG pathway that is over-represented in a chamber in both proteins and metabolites. 
+
+C. Lastly, I compare diabetic vs non-diabetic samples in ICM patients in the same chamber (LV or RV) while adjusted for (log2) age and sex. Only ICM samples are included in this analysis. Contrast is specified as diabetic minus non-diabetic at both LV and RV, meaning that positive log-FC indicates higher expression in diabetic than non-diabetic patients. 
+
+
+
+```{r}
+library(here)
+library(tidyverse)
+library(knitr)
+library(RColorBrewer)
+library(ggpubr)
+library(DT)
+library(pheatmap)
+library(ggrepel)
+library(grid)
+library(ggsci)
+library(ggvenn)
+library(ggupset)
+library(limma)
+library(org.Hs.eg.db)
+library(KEGGREST)
+
+source(here("data/utils.R"))
+#### Load the complete meta data
+load(here("data/211001_normalised_protandmetab_data_with_meta.rda"))
+prot <- protData$ptnorm
+pmeta <- protData$ptmeta
+metab <- metabData$mtnorm
+mtmeta <- metabData$mtmeta
+
+#### Load DE results from the donor analysis
+#### Saved from donorLV_RV.Rmd
+load(here("data/forPage/211001_prot_donorLVRV.rda"))
+load(here("data/forPage/211001_metab_donorLVRV.rda"))
+
+#### Load MDS data
+load(here("data/211002_mds.rda"))
+```
+
+```{r}
+smooth_genewise_cor <- function(y, dupcor) {
+   na.atanh <- is.finite(dupcor$atanh.correlations)
+   avgExpr <- rowMeans(y, na.rm = TRUE)
+   o <- order(avgExpr[na.atanh])
+   smooth.cor <- tricubeMovingAverage(dupcor$atanh.correlations[na.atanh][o], span = 0.2)
+   smooth.cor <- smooth.cor[match(1:length(o), o)]
+   correlation <- NA
+   correlation[na.atanh] <- smooth.cor
+   # estimate correlation for NAs
+   est_na <- approx(avgExpr[na.atanh], smooth.cor, xout = avgExpr[!na.atanh], rule = 2, ties = min)$y
+   correlation[!na.atanh] <- est_na
+   correlation
+}
+```
+
+
+
+```{r}
+# Gather 2018 diabetes labels
+db18 <- readxl::read_xlsx(here("data/diabeteslabel/Sample IDs 2018 2019 human heart mass spec.xlsx"), sheet = 2) %>% dplyr::select(`Bank ID`, Diabetes, Note)
+colnames(db18) <- c("bank", "diabetes18", "dbtype")
+db18 <- mutate(db18, bank2 = str_sub(bank, end = 5)) %>% 
+  mutate(bank = ifelse(bank != bank2, 
+                        as.character(round(as.numeric(bank), 4)), bank)) %>% 
+  dplyr::select(-bank2) %>% 
+  distinct()
+# 4.039 should be diabetic
+db18 <- filter(db18, bank != "4.039" | !is.na(dbtype))
+
+pmeta <- mutate(pmeta, diabetes = as.character(diabetes)) %>% 
+  left_join(db18, by = "bank") %>% 
+  mutate(diabetes = ifelse(is.na(diabetes), diabetes18, diabetes)) %>% 
+  dplyr::select(!diabetes18)
+
+# Also merge diabetic lables to the metabolomics data
+mtmeta <- mutate(mtmeta, diabetes = as.character(diabetes)) %>% 
+  left_join(db18, by = "bank") %>% 
+  mutate(diabetes = ifelse(is.na(diabetes), diabetes18, diabetes)) %>% 
+  dplyr::select(!diabetes18)
+```
+
+
+# Diabetes patient and sample summary
+
+One thing to notice is that just like the donor analysis, we only include samples that are LV-RV matched in the same patient for the 2020 batch. As the result, there is no 2020 diabetic patient included in any of the analysis. All diabetic samples come from the 2018 batch. All donors are non-diabetic. 
+
+
+## Proteomics
+
+```{r, fig.height=2.8, fig.width=6}
+protdb <- filter(pmeta, diabetes == "Yes")
+prot_dbsubj <- ggplot(filter(protdb, !duplicated(bank)), 
+                      aes(x = condition, fill = sex)) + 
+  geom_bar() + 
+  geom_text(aes(label = ..count..), stat = "count", 
+            position = position_stack(vjust = 0.5), size = 8, fontface = 2) + 
+  scale_fill_manual(values = brewer.pal(6, "Pastel2")) + 
+  theme_bw() + 
+  labs(x = "Condition", y = "Count", fill = "Gender") + 
+  ggtitle("Gender")
+prot_dbsubj_age <- ggplot(filter(protdb, !duplicated(bank)), 
+       aes(x = condition, y = age, fill = condition)) + 
+  geom_boxplot(alpha = 0.8) + 
+  scale_fill_manual(values = brewer.pal(6, "Dark2")[2:3]) + 
+  theme_bw() + 
+  labs(x = "Condition", y = "Age", fill = "Condition") + 
+  ggtitle("Age")
+ggarrange(prot_dbsubj, prot_dbsubj_age, nrow = 1)
+
+# sample location distribution in diabetic patients
+pmeta_forTile <- dplyr::select(protdb, locBank, condition, location, bank, 
+                               dbtype, sex, age) %>% 
+  mutate(location = factor(location, levels = c("RV", "LV"))) %>% 
+  arrange(condition, locBank) %>% 
+  mutate(bank = factor(bank, levels = unique(bank))) %>% 
+  mutate(dbtype = str_sub(dbtype, end = 2), 
+         label = paste0("(", sex, ",", age, ")"))
+prot_tile <- ggplot(pmeta_forTile, aes(x = bank, y = location, fill = condition)) +
+  geom_tile(color = "white", size = 0.2, alpha = 0.8) +
+  scale_fill_manual(values = brewer.pal(6, "Dark2")[2:3]) +
+  geom_text(aes(label = dbtype), size = 5, vjust = 0.2, color = "white",
+            fontface = 2) +
+  geom_text(aes(label = label), size = 2.8, vjust = 2, color = "white") +
+  theme_classic() +
+  coord_equal() +
+  theme(axis.text.x = element_text(angle = 80, vjust = 0.5, hjust = 0.4, size = 7), 
+        axis.ticks.x = element_blank()) +
+  labs(x = "Heart ID", y = "Location", fill = "Condition") + 
+  ggtitle("Sample location")
+```
+
+```{r, fig.height=2, fig.width=8}
+prot_tile
+```
+
+
+
+
+
+
+
+
+
+## Metabolomics
+
+```{r, fig.height=2.8, fig.width=6}
+# metabolomics
+mtdb <- filter(mtmeta, diabetes == "Yes")
+mt_dbsubj <- ggplot(filter(mtdb, !duplicated(bank)), 
+                      aes(x = condition, fill = sex)) + 
+  geom_bar() + 
+  geom_text(aes(label = ..count..), stat = "count", 
+            position = position_stack(vjust = 0.5), size = 8, fontface = 2) + 
+  scale_fill_manual(values = brewer.pal(6, "Pastel2")) + 
+  theme_bw() + 
+  labs(x = "Condition", y = "Count", fill = "Gender") + 
+  ggtitle("Diabetic hearts")
+mt_dbsubj_age <- ggplot(filter(mtdb, !duplicated(bank)), 
+       aes(x = condition, y = age, fill = condition)) + 
+  geom_boxplot(alpha = 0.8) + 
+  scale_fill_manual(values = brewer.pal(6, "Dark2")[2:3]) + 
+  theme_bw() + 
+  labs(x = "Condition", y = "Age", fill = "Condition") + 
+  ggtitle("Age")
+ggarrange(mt_dbsubj, mt_dbsubj_age, nrow = 1)
+
+mtmeta_forTile <- dplyr::select(mtdb, locBank, condition, location, bank, 
+                               dbtype, sex, age) %>% 
+  mutate(location = factor(location, levels = c("RV", "LV"))) %>% 
+  arrange(condition, locBank) %>% 
+  mutate(bank = factor(bank, levels = unique(bank))) %>% 
+  mutate(dbtype = str_sub(dbtype, end = 2), 
+         label = paste0("(", sex, ",", age, ")"))
+mt_tile <- ggplot(mtmeta_forTile, aes(x = bank, y = location, fill = condition)) +
+  geom_tile(color = "white", size = 0.2, alpha = 0.8) +
+  scale_fill_manual(values = brewer.pal(6, "Dark2")[2:3]) +
+  geom_text(aes(label = dbtype), size = 5, vjust = 0.2, color = "white",
+            fontface = 2) +
+  geom_text(aes(label = label), size = 2.8, vjust = 2, color = "white") +
+  theme_classic() +
+  coord_equal() +
+  theme(axis.text.x = element_text(angle = 80, vjust = 0.5, hjust = 0.4, size = 7), 
+        axis.ticks.x = element_blank()) +
+  labs(x = "Heart ID", y = "Location", fill = "Condition") + 
+  ggtitle("Sample location")
+```
+
+```{r, fig.height=2, fig.width=7}
+mt_tile
+```
+
+<br><br><br><br>
+
+
+
+# Protein differential expression between LV and RV in HF
+
+In this section, differential expression analysis is performed to compare LV and RV samples in heart failure. Design matrix is constructed to adjust for gender, log2-age and diabetes. Contrast is specified as LV minus RV, meaning that positive log-FC indicates higher expression in LV than RV. Differential expression results in each HF is then compared with those differentially expressed between chambers in donor hearts.
+
+
+
+## MDS plots
+
+```{r, fig.height=5, fig.width=12}
+protMDS_dcm <- ggplot() + 
+  geom_point(data = add_row(filter(protMDS, condition != "DCM"), 
+                            filter(protMDS, condition == "DCM")), 
+             aes(x = x, y = y, color = condition, shape = location), 
+             size = 2.8, alpha = 0.8, stroke = 0.8) + 
+  theme_classic2() + 
+  scale_shape_manual(values = c(16, 8)) + 
+  scale_color_manual(values = c(brewer.pal(8, "Greys")[4], 
+                                brewer.pal(8, "Dark2")[2], 
+                                brewer.pal(8, "Greys")[4])) + 
+  labs(x = "Leading logFC dim 1", y = "Leading logFC dim 2", 
+       color = "Condition", shape = "Location")
+protMDS_icm <- ggplot() + 
+  geom_point(data = add_row(filter(protMDS, condition != "ICM"), 
+                            filter(protMDS, condition == "ICM")), 
+             aes(x = x, y = y, color = condition, shape = location), 
+             size = 2.8, alpha = 0.8, stroke = 0.8) + 
+  theme_classic2() + 
+  scale_shape_manual(values = c(16, 8)) + 
+  scale_color_manual(values = c(brewer.pal(8, "Greys")[4], 
+                                brewer.pal(8, "Greys")[4], 
+                                brewer.pal(8, "Dark2")[3])) + 
+  labs(x = "Leading logFC dim 1", y = "Leading logFC dim 2", 
+       color = "Condition", shape = "Location")
+ggarrange(protMDS_dcm, protMDS_icm, nrow = 1)
+```
+
+
+Samples are clearly clustered by location in ICM. Less clear separation in DCM. 
+
+
+## But first, compare donors to HF (combine ICM to DCM)
+
+After adjusting for log2-age, gender, diabetes and sample location: 
+
+```{r}
+# pmeta <- mutate(pmeta, diseased = ifelse(condition == "Donor", "Donor", "HF")) %>% 
+#   mutate(diseased = factor(diseased, levels = c("Donor", "HF")))
+pmeta <- mutate(pmeta, diseased = ifelse(condition == "Donor", "Donor", "HF")) %>% 
+  mutate(diseased = factor(diseased, levels = c("Donor", "HF"))) %>% 
+  mutate(group2 = str_c(diseased, location, sep = "_"))
+
+design <- model.matrix(~ 0 + group2 + log2age + sex + diabetes, data = pmeta)
+colnames(design) <- str_remove_all(colnames(design), pattern = "group2")
+contrasts <- makeContrasts(HF_LVminusRV = HF_LV - HF_RV, 
+                           # Donor_LVminusRV = Donor_LV - Donor_RV,
+                           levels = design)
+```
+
+```{r}
+prot <- t(prot)
+suppressWarnings(dupcor <- duplicateCorrelation(prot, design, block = pmeta$bank))
+correlations <- smooth_genewise_cor(prot, dupcor)
+protfit <- lmFit2(prot, design, block = pmeta$bank, correlation = correlations)
+protfit <- contrasts.fit(protfit, contrasts = contrasts)
+eprotfit <- eBayes(protfit)
+kable(summary(decideTests(eprotfit)))
+```
+
+```{r}
+tmpDF <- data.frame(class = c("Up", "Down", "NotSig"), 
+                    count = c(28, 121, 2642)) %>% 
+  mutate(class = factor(class, levels = c("Up", "Down", "NotSig")))
+ggplot(tmpDF, aes(x = class, y = count, fill = class)) + 
+  geom_col(show.legend = FALSE) + 
+  geom_text(aes(label = count), position = position_dodge(width = 1), vjust = -0.4, size = 4) + 
+  theme_linedraw() +
+  scale_fill_manual(values = brewer.pal(9, "Set1")[c(1:2, 9)]) + 
+  labs(x = "DE status between donor vs HF", y = "Count")
+```
+
+
+
+And what are these proteins:
+
+```{r}
+HF_vs_Donor_prot <- topTable(eprotfit, coef = "HF_LVminusRV", number = Inf) %>% signif(2) %>% 
+  mutate(GeneID = str_sub(rownames(.), start = 2), .before = 1) %>% 
+  left_join(protLVRV$protDEefit$genes, by = "GeneID") %>% 
+  dplyr::select(GeneID, Symbol, chromosome, type_of_gene, everything()) %>% 
+  filter(!is.na(logFC)) %>% 
+  arrange(adj.P.Val)
+datatable(HF_vs_Donor_prot, width = "95%", options = list(scrollX = TRUE))
+
+# save
+# write.csv(HF_vs_Donor_prot, file = "tables/211105_Proteomics_HF_LVvsRV_DE.csv", row.names = FALSE)
+```
+
+
+
+Volcano plot:
+
+```{r, fig.height=4, fig.width=7}
+HF_vs_Donor_prot_dt <- data.frame(decideTests(eprotfit)) %>% 
+  rownames_to_column("GeneID") %>% 
+  mutate(GeneID = str_sub(GeneID, start = 2))
+HF_vs_Donor_prot_vol <- mutate(HF_vs_Donor_prot, logP = -log10(adj.P.Val)) %>% 
+  left_join(dplyr::select(HF_vs_Donor_prot_dt, GeneID, HF_LVminusRV), by = "GeneID") %>% 
+  mutate(HF_LVminusRV = factor(HF_LVminusRV, levels = c(1, -1, 0))) %>% 
+  filter(!is.na(logFC))
+levels(HF_vs_Donor_prot_vol$HF_LVminusRV) <- c("Up", "Down", "Not significant")
+
+# save as list
+HF_vs_Donor_prot_list <- list(DE = HF_vs_Donor_prot_vol$Symbol[HF_vs_Donor_prot_vol$HF_LVminusRV != 
+                                                                 "Not significant"], 
+                              Up = HF_vs_Donor_prot_vol$Symbol[HF_vs_Donor_prot_vol$HF_LVminusRV == 
+                                                                 "Up"], 
+                              Down = HF_vs_Donor_prot_vol$Symbol[HF_vs_Donor_prot_vol$HF_LVminusRV == 
+                                                                 "Down"])
+
+ggplot(HF_vs_Donor_prot_vol, aes(x = logFC, y = -log10(adj.P.Val), color = HF_LVminusRV)) + 
+  geom_point(size = 0.8) + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", size = 0.4) + 
+  geom_text_repel(data = filter(HF_vs_Donor_prot_vol, logP > 2.4), show.legend = FALSE, 
+            aes(label = Symbol), size = 2.8, color = "black") + 
+  theme_bw() +
+  scale_color_manual(values = brewer.pal(9, "Set1")[c(1:2, 9)]) + 
+  labs(x = "log2FC(LV/RV in HF)", y = "-log10P", color = "DEP")
+```
+
+
+
+Compare with the list of proteins differentially expressed in donors LV vs RV:
+
+```{r}
+donorOnly <- data.frame(decideTests(protLVRV$protDEefit)) %>% 
+  add_column(data.frame(decideTests(eprotfit))) %>% rownames_to_column("GeneID")
+# as list
+donor_vs_HF <- list(donorLVvsRV = na.omit(donorOnly$GeneID[donorOnly$donor != 0]), 
+                    Up_donorLVvsRV = na.omit(donorOnly$GeneID[donorOnly$donor == 1]), 
+                    Down_donorLVvsRV = na.omit(donorOnly$GeneID[donorOnly$donor == -1]), 
+                    HFvsDonor = na.omit(donorOnly$GeneID[donorOnly$HF_LVminusRV != 0]), 
+                    Up_HFmDonor = na.omit(donorOnly$GeneID[donorOnly$HF_LVminusRV == 1]), 
+                    Down_HFmDonor = na.omit(donorOnly$GeneID[donorOnly$HF_LVminusRV == -1]))
+
+ggvenn(donor_vs_HF[c(4, 1)], show_percentage = FALSE, 
+       fill_color = c("#1B9E77", "#BEBADA"), fill_alpha = 0.8, 
+       stroke_color = "transparent", text_size = 6) + 
+  ggtitle("DE proteins")
+
+# save the list
+df_save <- matrix(NA, nrow = 760, ncol = 3) %>% as.data.frame()
+colnames(df_save) <- c("DE in donor only", "DE in HF only", "DE in both HF and donor")
+df_save$`DE in donor only` <- setdiff(donor_vs_HF$donorLVvsRV, donor_vs_HF$HFvsDonor)
+df_save$`DE in HF only`[1:70] <- setdiff(donor_vs_HF$HFvsDonor, donor_vs_HF$donorLVvsRV)
+df_save$`DE in both HF and donor`[1:79] <- intersect(donor_vs_HF$HFvsDonor, donor_vs_HF$donorLVvsRV)
+
+tmp1 <- data.frame(GeneID = str_sub(df_save$`DE in donor only`, start = 2)) %>% 
+  left_join(dplyr::select(HF_vs_Donor_prot, GeneID, Symbol), by = "GeneID")
+tmp2 <- data.frame(GeneID = str_sub(df_save$`DE in HF only`[1:70], start = 2)) %>% 
+  left_join(dplyr::select(HF_vs_Donor_prot, GeneID, Symbol), by = "GeneID")
+tmp3 <- data.frame(GeneID = str_sub(df_save$`DE in both HF and donor`[1:79], start = 2)) %>% 
+  left_join(dplyr::select(HF_vs_Donor_prot, GeneID, Symbol), by = "GeneID")
+
+df_save$`DE in donor only` <- tmp1$Symbol
+df_save$`DE in HF only`[1:70] <- tmp2$Symbol
+df_save$`DE in both HF and donor`[1:79] <- tmp3$Symbol
+# write.csv(df_save, file = "tables/211105_Proteomics_DonorvsHF_DE.csv")
+
+# we want these in the intersection
+toLook <- filter(HF_vs_Donor_prot_vol, GeneID %in% str_sub(intersect(donor_vs_HF$donorLVvsRV,
+                                                           donor_vs_HF$HFvsDonor), start = 2))
+donorProt <- topTable(protLVRV$protDEefit, coef = "donor", number = Inf) %>% 
+  mutate(logFC = signif(logFC, 2), 
+         AveExpr = signif(AveExpr, 2), 
+         t = signif(t, 2), 
+         P.Value = signif(P.Value, 2), 
+         adj.P.Val = signif(adj.P.Val, 2), 
+         B = signif(B, 2), ) %>% 
+  arrange(adj.P.Val)
+
+gatherDEstats0 <- function(ind, tocompwith = HF_vs_Donor_prot_vol, cond = "HF_LVminusRV") {
+  tmpDonor <- filter(donorProt, Symbol %in% ind) %>% 
+    dplyr::select(-B, -AveExpr, -P.Value, -t) %>% 
+    dplyr::rename(donor_logFC = logFC, donor_adj.P.Val = adj.P.Val)
+  tmpHF <- filter(tocompwith, Symbol %in% ind) %>% 
+    dplyr::select(-Symbol, -chromosome, -type_of_gene, -B, -AveExpr, -P.Value, -t, -logP, -HF_LVminusRV)
+  colnames(tmpHF)[-1] <- paste(cond, colnames(tmpHF)[-1], sep = "_")
+  left_join(tmpDonor, tmpHF, by = "GeneID") %>% dplyr::select(GeneID, everything())
+}
+datatable(gatherDEstats0(toLook$Symbol, tocompwith = HF_vs_Donor_prot_vol, cond = "HF_LVminusRV"))
+```
+
+
+
+
+- Compare the logFC:
+
+```{r, fig.height=5, fig.width=7}
+prot_HFvsdonor <- gatherDEstats0(ind = toLook$Symbol, tocompwith = HF_vs_Donor_prot_vol, 
+                                  cond = "HF_LVminusRV") %>% 
+  mutate(class = ifelse(sign(donor_logFC) == sign(HF_LVminusRV_logFC), "Same", "Opposite"))
+table(prot_HFvsdonor$class)
+
+ggplot(data = filter(prot_HFvsdonor, class == "Same"), 
+       aes(x = donor_logFC, y = HF_LVminusRV_logFC, color = class)) + 
+  geom_hline(yintercept = 0, color = "#a6a6a6", linetype = "dashed") + 
+  geom_vline(xintercept = 0, color = "#a6a6a6", linetype = "dashed") + 
+  geom_point(size = 0.8) +
+  annotate("rect", xmin = -Inf, xmax = 0, ymin = 0, ymax = Inf, 
+           fill = "#a6a6a6", alpha = 0.15) + 
+  annotate("rect", xmin = 0, xmax = Inf, ymin = -Inf, ymax = 0, 
+           fill = "#a6a6a6", alpha = 0.15) + 
+  geom_abline(slope = 1, intercept = 0, color = "#a6a6a6", linetype = "dashed") + 
+  geom_point(data = filter(prot_HFvsdonor, class == "Opposite"), alpha = 0.8, 
+             aes(x = donor_logFC, y = HF_LVminusRV_logFC, color = class), size = 1.2) + 
+  geom_text_repel(data = filter(prot_HFvsdonor, class == "Opposite"), 
+                  position = position_nudge(x = 0.02, y = 0.02),
+                  aes(label = Symbol), size = 2.8, 
+                  show.legend = FALSE, color = "black") + 
+  scale_color_manual(values = c("#FDB462", "#999999")) + 
+  theme_bw() +
+  labs(x = "log2FC(LV/RV in donors)", y = "log2FC(LV/RV in HF)", color = "DE direction")
+```
+
+
+
+
+Plot out a few proteins for figures: (sex differences)
+
+```{r}
+# filter(donorProt, Symbol == "CTNNA1")
+thisProtein <- data.frame(thisprot = prot["G1495", ]) %>% 
+  rownames_to_column("locBank") %>% 
+  left_join(mtmeta, by = "locBank") %>% 
+  filter(condition == "Donor")
+
+ggplot(thisProtein, aes(x = location, y = thisprot, fill = sex)) + 
+  geom_boxplot() + 
+  theme_linedraw() + 
+  ggtitle("CTNNA1")
+```
+
+
+
+
+
+
+
+
+
+
+
+## DE summary in each condition
+
+```{r}
+design <- model.matrix(~ 0 + group + log2age + sex + diabetes, data = pmeta)
+colnames(design)[1:6] <- str_sub(colnames(design)[1:6], start = 6)
+contrasts <- makeContrasts(DCM = DCM_LV - DCM_RV, 
+                           ICM = ICM_LV - ICM_RV, levels = design)
+```
+
+
+```{r}
+suppressWarnings(dupcor <- duplicateCorrelation(prot, design, block = pmeta$bank))
+correlations <- smooth_genewise_cor(prot, dupcor)
+protfit <- lmFit2(prot, design, block = pmeta$bank, correlation = correlations)
+protfit <- contrasts.fit(protfit, contrasts = contrasts)
+eprotfit <- eBayes(protfit)
+kable(summary(decideTests(eprotfit)))
+```
+
+- The number of differentially expressed proteins are very different between HF. Also, recall the counts we have in donor LV vs RV: 
+
+```{r}
+kable(summary(decideTests(protLVRV$protDEefit)))
+```
+
+A lot of the DE proteins in donors are no longer differentially expressed between chambers in HF.
+
+
+## DCM DE list
+
+- Only 4 significantly differentially expressed proteins between chambers in DCM, which are all down-regulated in LV. 
+
+```{r}
+dcmProt <- topTable(eprotfit, coef = "DCM", number = Inf) %>% signif(2) %>% 
+  mutate(GeneID = str_sub(rownames(.), start = 2), .before = 1) %>% 
+  left_join(protLVRV$protDEefit$genes, by = "GeneID") %>% 
+  dplyr::select(GeneID, Symbol, chromosome, type_of_gene, everything()) %>% 
+  filter(!is.na(logFC)) %>% 
+  arrange(adj.P.Val)
+datatable(dcmProt, width = "95%", options = list(scrollX = TRUE))
+
+# save
+# write.csv(dcmProt, file = "tables/211105_Proteomics_DCM_LVvsRV_DE.csv", row.names = FALSE)
+```
+
+- Volcano plot: 
+
+```{r, fig.height=4, fig.width=7}
+dtProt <- data.frame(decideTests(eprotfit)) %>% 
+  rownames_to_column("GeneID") %>% 
+  mutate(GeneID = str_sub(GeneID, start = 2))
+dcmProt_vol <- mutate(dcmProt, logP = -log10(adj.P.Val)) %>% 
+  left_join(dplyr::select(dtProt, GeneID, DCM), by = "GeneID") %>% 
+  mutate(DCM = factor(DCM, levels = c(1, -1, 0))) %>% 
+  filter(!is.na(logFC))
+levels(dcmProt_vol$DCM) <- c("Up", "Down", "Not significant")
+
+ggplot(dcmProt_vol, aes(x = logFC, y = -log10(adj.P.Val), color = DCM)) + 
+  geom_point(size = 0.8) + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", size = 0.4) + 
+  geom_text_repel(data = filter(dcmProt_vol, adj.P.Val < 0.05), show.legend = FALSE, 
+            aes(label = Symbol), size = 2.8, color = "black") + 
+  theme_bw() +
+  scale_color_manual(values = brewer.pal(9, "Set1")[c(2, 9)]) + 
+  labs(x = "log2FC", y = "-log10(P-value)", color = "DEP")
+```
+
+
+Compare with the protein list that are DE between DCM and ICM
+
+
+
+## ICM DE list
+
+```{r}
+icmProt <- topTable(eprotfit, coef = "ICM", number = Inf) %>% signif(2) %>% 
+  mutate(GeneID = str_sub(rownames(.), start = 2), .before = 1) %>% 
+  left_join(protLVRV$protDEefit$genes, by = "GeneID") %>% 
+  dplyr::select(GeneID, Symbol, chromosome, type_of_gene, everything()) %>% 
+  filter(!is.na(logFC)) %>% 
+  arrange(adj.P.Val)
+datatable(icmProt, width = "95%", options = list(scrollX = TRUE))
+
+# save
+# write.csv(icmProt, file = "tables/211105_Proteomics_ICM_LVvsRV_DE.csv", row.names = FALSE)
+```
+
+
+- Volcano plot: 
+
+```{r, fig.height=4, fig.width=7}
+icmProt_vol <- mutate(icmProt, logP = -log10(adj.P.Val)) %>% 
+  left_join(dplyr::select(dtProt, GeneID, ICM), by = "GeneID") %>% 
+  mutate(ICM = factor(ICM, levels = c(1, -1, 0))) %>% 
+  filter(!is.na(logFC))
+levels(icmProt_vol$ICM) <- c("Up", "Down", "Not significant")
+
+ggplot(icmProt_vol, aes(x = logFC, y = -log10(adj.P.Val), color = ICM)) + 
+  geom_point(size = 0.8) + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", size = 0.4) + 
+  geom_text_repel(data = filter(icmProt_vol, adj.P.Val < 0.002), show.legend = FALSE, 
+            aes(label = Symbol), size = 2.8, color = "black") + 
+  theme_bw() +
+  scale_color_manual(values = brewer.pal(9, "Set1")[c(1, 2, 9)]) + 
+  labs(x = "log2FC", y = "-log10(P-value)", color = "DEP")
+```
+
+
+
+## Compare with differential expression in donors
+
+```{r}
+all_protdt <- data.frame(decideTests(protLVRV$protDEefit)) %>% 
+  add_column(data.frame(decideTests(eprotfit))) %>% rownames_to_column("GeneID")
+all_protDE <- mutate(all_protdt, donor = abs(donor), 
+                     DCM = abs(DCM), ICM = abs(ICM))
+```
+
+
+- Upset plot of all DE proteins: 
+
+```{r, fig.height=2.98, fig.width=6}
+all_protDE_filt <- filter(all_protDE, donor == 1 | DCM == 1 | ICM == 1)
+all_protDE_filt <- mutate(all_protDE_filt, 
+                          class = lapply(GeneID, function(i) {
+  tmp <- filter(all_protDE_filt, GeneID == i) %>% 
+    mutate(donor = ifelse(donor == 1, "Donor", NA), 
+           DCM = ifelse(DCM == 1, "DCM", NA), 
+           ICM = ifelse(ICM == 1, "ICM", NA))
+  as.character(na.omit(c(tmp$donor, tmp$DCM, tmp$ICM)))
+}))
+
+ggplot(all_protDE_filt, aes(x = class)) +
+  geom_bar() + 
+  scale_x_upset(n_intersections = 10) +
+  geom_text(stat = "count", aes(label = ..count..), vjust = -0.2, size = 2.8) +
+  theme_bw()
+```
+
+
+
+
+
+
+
+### DCM vs Donor
+
+
+```{r, fig.height=2, fig.width=2.5}
+protDE <- list(Donor = all_protDE$GeneID[all_protDE$donor == 1], 
+               DCM = all_protDE$GeneID[all_protDE$DCM == 1], 
+               ICM = all_protDE$GeneID[all_protDE$ICM == 1])
+protDE <- lapply(protDE, function(x) x[!is.na(x)])
+
+ggvenn(protDE[1:2], show_percentage = FALSE, 
+       fill_color = brewer.pal(6, "Dark2")[1:2], fill_alpha = 0.8, 
+       stroke_color = "transparent", text_size = 4) + 
+  ggtitle("DE proteins")
+
+
+# save the list
+df_save <- matrix(NA, nrow = 838, ncol = 3) %>% as.data.frame()
+colnames(df_save) <- c("DE in donor only", "DE in DCM only", "DE in both DCM and donor")
+df_save$`DE in donor only` <- setdiff(protDE$Donor, protDE$DCM)
+df_save$`DE in DCM only`[1:3] <- setdiff(protDE$DCM, protDE$Donor)
+df_save$`DE in both DCM and donor`[1] <- intersect(protDE$DCM, protDE$Donor)
+
+tmp1 <- data.frame(GeneID = str_sub(df_save$`DE in donor only`, start = 2)) %>% 
+  left_join(dplyr::select(HF_vs_Donor_prot, GeneID, Symbol), by = "GeneID")
+tmp2 <- data.frame(GeneID = str_sub(df_save$`DE in DCM only`[1:3], start = 2)) %>% 
+  left_join(dplyr::select(HF_vs_Donor_prot, GeneID, Symbol), by = "GeneID")
+tmp3 <- data.frame(GeneID = str_sub(df_save$`DE in both DCM and donor`[1], start = 2)) %>% 
+  left_join(dplyr::select(HF_vs_Donor_prot, GeneID, Symbol), by = "GeneID")
+
+df_save$`DE in donor only` <- tmp1$Symbol
+df_save$`DE in DCM only`[1:3] <- tmp2$Symbol
+df_save$`DE in both DCM and donor`[1] <- tmp3$Symbol
+# write.csv(df_save, file = "tables/211105_Proteomics_Donor-vs-DCM_DE_lists.csv")
+```
+
+
+- The only protein that is differentially expressed between chambers in both DCM and donors: 
+
+```{r}
+donorProt <- topTable(protLVRV$protDEefit, coef = "donor", number = Inf) %>% 
+  mutate(logFC = signif(logFC, 2), 
+         AveExpr = signif(AveExpr, 2), 
+         t = signif(t, 2), 
+         P.Value = signif(P.Value, 2), 
+         adj.P.Val = signif(adj.P.Val, 2), 
+         B = signif(B, 2), ) %>% 
+  arrange(adj.P.Val)
+
+ind <- filter(all_protdt, GeneID %in% intersect(protDE$Donor, protDE$DCM)) %>% 
+  dplyr::select(-ICM) %>% 
+  mutate(GeneID = str_sub(GeneID, start = 2))
+```
+
+
+
+```{r}
+gatherDEstats <- function(ind, HF = dcmProt, cond = "DCM") {
+  tmpDonor <- filter(donorProt, GeneID %in% ind) %>% 
+    dplyr::select(-B, -AveExpr, -P.Value, -t) %>% 
+    dplyr::rename(donor_logFC = logFC, donor_adj.P.Val = adj.P.Val)
+  tmpHF <- filter(HF, GeneID %in% ind) %>% 
+    dplyr::select(-Symbol, -chromosome, -type_of_gene, -B, -AveExpr, -P.Value, -t)
+  colnames(tmpHF)[-1] <- paste(cond, colnames(tmpHF)[-1], sep = "_")
+  left_join(tmpDonor, tmpHF, by = "GeneID")
+}
+
+datatable(gatherDEstats(ind$GeneID, HF = dcmProt, cond = "DCM"), width = "95%", options = list(scrollX = TRUE))
+```
+
+
+
+- The three proteins that are DE in LV vs RV in DCM but not donors:
+
+```{r}
+ind <- filter(all_protdt, GeneID %in% setdiff(protDE$DCM, protDE$Donor)) %>% 
+  dplyr::select(-ICM) %>% 
+  mutate(GeneID = str_sub(GeneID, start = 2))
+datatable(gatherDEstats(ind$GeneID, HF = dcmProt, cond = "DCM"), width = "95%", options = list(scrollX = TRUE))
+```
+
+
+
+- Compare the logFC:
+
+```{r, fig.height=5, fig.width=7}
+prot_dcmVSdonor <- gatherDEstats(donorProt$GeneID, HF = dcmProt, cond = "DCM") %>%
+  left_join(mutate(all_protdt, GeneID = str_sub(GeneID, start = 2)), by = "GeneID") %>% 
+  dplyr::select(Symbol, donor_logFC, DCM_logFC, donor, DCM) %>% 
+  mutate(class = abs(donor) + abs(DCM)) %>% 
+  mutate(class = ifelse(donor != 0 & class == 1, "Donor", class), 
+         class = ifelse(DCM != 0 & class == 1, "DCM", class), 
+         class = ifelse(class == 2, "Both DCM and donor", class), 
+         class = ifelse(class == 0, "Insignificant", class)) %>% 
+  dplyr::select(-donor, -DCM) %>% 
+  mutate(class = factor(class, levels = c("Both DCM and donor", 
+                                          "Donor", "DCM", "Insignificant")))
+
+ggplot(data = filter(prot_dcmVSdonor, class == "Insignificant"), 
+       aes(x = donor_logFC, y = DCM_logFC, color = class)) + 
+  geom_hline(yintercept = 0, color = "#a6a6a6", linetype = "dashed") + 
+  geom_vline(xintercept = 0, color = "#a6a6a6", linetype = "dashed") + 
+  geom_point(size = 0.8) +
+  annotate("rect", xmin = -Inf, xmax = 0, ymin = 0, ymax = Inf, 
+           fill = "#a6a6a6", alpha = 0.15) + 
+  annotate("rect", xmin = 0, xmax = Inf, ymin = -Inf, ymax = 0, 
+           fill = "#a6a6a6", alpha = 0.15) + 
+  geom_point(data = filter(prot_dcmVSdonor, class == "Donor"), alpha = 0.8, 
+             aes(x = donor_logFC, y = DCM_logFC, color = class), size = 0.8) + 
+  geom_point(data = filter(prot_dcmVSdonor, class %in% c("DCM", 
+                                                         "Both DCM and donor")), 
+             aes(x = donor_logFC, y = DCM_logFC, color = class), size = 2, 
+             alpha = 0.8) + 
+  geom_abline(slope = 1, intercept = 0, color = "#a6a6a6", linetype = "dashed") + 
+  geom_text_repel(data = filter(prot_dcmVSdonor, 
+                                class %in% c("Both DCM and donor", "DCM")), 
+                  position = position_nudge(x = -0.1, y = 0.1),
+                  aes(label = Symbol), size = 2.8, 
+                  show.legend = FALSE, color = "black") + 
+  scale_color_manual(values = c("#FDB462", "#1B9E77", "#D95F02", "#a6a6a6")) + 
+  theme_bw() +
+  labs(x = "log2FC (donor)", y = "log2FC (DCM)", color = "Significant in")
+```
+
+
+
+### ICM vs Donor
+
+```{r, fig.height=2, fig.width=2.5}
+icmdonorDE_plot <- ggvenn(protDE[c(1, 3)], show_percentage = FALSE, 
+       fill_color = brewer.pal(6, "Dark2")[c(1, 3)], fill_alpha = 0.8, 
+       stroke_color = "transparent", text_size = 4) + 
+  ggtitle("DE proteins")
+icmdonorDE_plot
+
+# save the list
+df_save <- matrix(NA, nrow = 727, ncol = 3) %>% as.data.frame()
+colnames(df_save) <- c("DE in donor only", "DE in ICM only", "DE in both ICM and donor")
+df_save$`DE in donor only` <- setdiff(protDE$Donor, protDE$ICM)
+df_save$`DE in ICM only`[1:119] <- setdiff(protDE$ICM, protDE$Donor)
+df_save$`DE in both ICM and donor`[1:112] <- intersect(protDE$ICM, protDE$Donor)
+
+tmp1 <- data.frame(GeneID = str_sub(df_save$`DE in donor only`, start = 2)) %>% 
+  left_join(dplyr::select(HF_vs_Donor_prot, GeneID, Symbol), by = "GeneID")
+tmp2 <- data.frame(GeneID = str_sub(df_save$`DE in ICM only`[1:119], start = 2)) %>% 
+  left_join(dplyr::select(HF_vs_Donor_prot, GeneID, Symbol), by = "GeneID")
+tmp3 <- data.frame(GeneID = str_sub(df_save$`DE in both ICM and donor`[1:112], start = 2)) %>% 
+  left_join(dplyr::select(HF_vs_Donor_prot, GeneID, Symbol), by = "GeneID")
+
+df_save$`DE in donor only` <- tmp1$Symbol
+df_save$`DE in ICM only`[1:119] <- tmp2$Symbol
+df_save$`DE in both ICM and donor`[1:112] <- tmp3$Symbol
+# write.csv(df_save, file = "tables/211105_Proteomics_Donor-vs-ICM_DE_lists.csv")
+```
+
+
+```{r, fig.height=2, fig.width=5}
+prot_dtUp <- list(Donor = all_protdt$GeneID[all_protdt$donor == 1], 
+                  DCM = all_protdt$GeneID[all_protdt$DCM == 1], 
+                  ICM = all_protdt$GeneID[all_protdt$ICM == 1])
+prot_dtDown <- list(Donor = all_protdt$GeneID[all_protdt$donor == -1], 
+                    DCM = all_protdt$GeneID[all_protdt$DCM == -1], 
+                    ICM = all_protdt$GeneID[all_protdt$ICM == -1])
+prot_dtUp <- lapply(prot_dtUp, function(x) x[!is.na(x)])
+prot_dtDown <- lapply(prot_dtDown, function(x) x[!is.na(x)])
+
+icmdonorUp_plot <- ggvenn(prot_dtUp[c(1, 3)], show_percentage = FALSE, 
+                          fill_color = brewer.pal(6, "Dark2")[c(1, 3)], fill_alpha = 0.8, 
+                          stroke_color = "transparent", text_size = 4) + 
+  ggtitle("Up-regulated in LV")
+icmdonorDown_plot <- ggvenn(prot_dtDown[c(1, 3)], show_percentage = FALSE, 
+                            fill_color = brewer.pal(6, "Dark2")[c(1, 3)], fill_alpha = 0.8, 
+                            stroke_color = "transparent", text_size = 4) + 
+  ggtitle("Down-regulated in LV")
+ggarrange(icmdonorUp_plot, icmdonorDown_plot, nrow = 1)
+```
+
+
+- n = 112 proteins that are significantly differentially expressed between chambers in both donors and ICM:
+
+```{r}
+datatable(gatherDEstats(str_sub(intersect(protDE$Donor, protDE$ICM), start = 2), HF = icmProt, cond = "ICM") %>% 
+            arrange(donor_adj.P.Val), width = "95%", options = list(scrollX = TRUE))
+```
+
+
+- Notice that, there are 7 (112 - 13 - 92 = 7) significant DE proteins that have opposite logFC signs in donors versus ICM:
+
+```{r}
+ind <- filter(all_protdt, GeneID %in% intersect(protDE$Donor, protDE$ICM)) %>% 
+  dplyr::select(-DCM) %>% 
+  filter(donor != ICM) %>% 
+  mutate(GeneID = str_sub(GeneID, start = 2))
+
+datatable(gatherDEstats(ind$GeneID, HF = icmProt, cond = "ICM") %>% arrange(ICM_adj.P.Val), width = "95%", options = list(scrollX = TRUE))
+```
+
+All other significant DE proteins that are common in donor and ICM have the same regulation direction (up/down in both donor and ICM).
+
+
+
+
+
+
+- Proteins that are no longer differentially expressed between heart chambers in ICM compared to donors: 
+
+```{r}
+datatable(gatherDEstats(str_sub(setdiff(protDE$Donor, protDE$ICM), start = 2), 
+                        HF = icmProt, cond = "ICM") %>% 
+            arrange(donor_adj.P.Val), 
+          width = "95%", options = list(scrollX = TRUE))
+```
+
+
+- Proteins become differentially expressed between heart chambers in ICM compared to donors:
+
+```{r}
+datatable(gatherDEstats(str_sub(setdiff(protDE$ICM, protDE$Donor), start = 2), 
+                        HF = icmProt, cond = "ICM") %>% 
+            arrange(ICM_adj.P.Val), 
+          width = "95%", options = list(scrollX = TRUE))
+```
+
+
+
+- Compare the logFC:
+
+```{r, fig.height=5, fig.width=7}
+prot_icmVSdonor <- gatherDEstats(donorProt$GeneID, HF = icmProt, cond = "ICM") %>%
+  left_join(mutate(all_protdt, GeneID = str_sub(GeneID, start = 2)), by = "GeneID") %>% 
+  dplyr::select(Symbol, donor_logFC, ICM_logFC, donor, ICM) %>% 
+  mutate(class = abs(donor) + abs(ICM)) %>% 
+  mutate(class = ifelse(donor != 0 & class == 1, "Donor", class), 
+         class = ifelse(ICM != 0 & class == 1, "ICM", class), 
+         class = ifelse(class == 2, "Both ICM and donor", class), 
+         class = ifelse(class == 0, "Insignificant", class)) %>% 
+  dplyr::select(-donor, -ICM) %>% 
+  mutate(class = factor(class, levels = c("Both ICM and donor", 
+                                          "Donor", "ICM", "Insignificant")))
+
+ggplot(data = filter(prot_icmVSdonor, class == "Insignificant"), 
+       aes(x = donor_logFC, y = ICM_logFC, color = class)) + 
+  geom_hline(yintercept = 0, color = "#a6a6a6", linetype = "dashed") + 
+  geom_vline(xintercept = 0, color = "#a6a6a6", linetype = "dashed") + 
+  geom_point(size = 0.8) +
+  annotate("rect", xmin = -Inf, xmax = 0, ymin = 0, ymax = Inf, 
+           fill = "#a6a6a6", alpha = 0.15) + 
+  annotate("rect", xmin = 0, xmax = Inf, ymin = -Inf, ymax = 0, 
+           fill = "#a6a6a6", alpha = 0.15) + 
+  geom_point(data = filter(prot_icmVSdonor, class %in% c("Donor", "ICM")), 
+             alpha = 0.8, 
+             aes(x = donor_logFC, y = ICM_logFC, color = class), size = 1) + 
+  geom_point(data = filter(prot_icmVSdonor, class == "Both ICM and donor"), 
+             aes(x = donor_logFC, y = ICM_logFC, color = class), size = 1, 
+             alpha = 0.8) + 
+  geom_abline(slope = 1, intercept = 0, color = "#a6a6a6", linetype = "dashed") + 
+  geom_text_repel(data = filter(prot_icmVSdonor, Symbol %in% donorProt$Symbol[donorProt$GeneID %in% ind$GeneID]), 
+                  aes(label = Symbol), size = 2.8, 
+                  position = position_nudge(x = -0.1, y = 0.1),
+                  show.legend = FALSE, color = "black") + 
+  scale_color_manual(values = c("#FDB462", "#1B9E77", "#7570B3", "#a6a6a6")) + 
+  theme_bw() +
+  labs(x = "log2FC (donor)", y = "log2FC (ICM)", color = "Significant in")
+```
+
+
+
+
+### Compare DE proteins with the 220
+
+```{r}
+# DE in DCM
+dcmLists <- list(pimary = str_c("G", toLook$GeneID, sep = ""), 
+                 dcm = protDE$DCM)
+ggvenn(dcmLists, show_percentage = FALSE, 
+       fill_color = brewer.pal(6, "Dark2")[1:2], fill_alpha = 0.8, 
+       stroke_color = "transparent", text_size = 4)
+datatable(gatherDEstats(str_sub(intersect(dcmLists$pimary, dcmLists$dcm), start = 2), 
+                        HF = icmProt, cond = "DCM"))
+
+# DE in ICM
+icmLists <- list(pimary = str_c("G", toLook$GeneID, sep = ""), 
+                 icm = protDE$ICM)
+ggvenn(icmLists, show_percentage = FALSE, 
+       fill_color = brewer.pal(6, "Dark2")[1:2], fill_alpha = 0.8, 
+       stroke_color = "transparent", text_size = 7)
+
+datatable(gatherDEstats(str_sub(intersect(icmLists$pimary, icmLists$icm), start = 2), 
+                        HF = icmProt, cond = "ICM"))
+```
+
+
+
+
+
+
+
+
+### DCM vs ICM
+
+```{r, fig.height=2, fig.width=2.5}
+ggvenn(protDE[2:3], show_percentage = FALSE, 
+       fill_color = brewer.pal(6, "Dark2")[2:3], fill_alpha = 0.8, 
+       stroke_color = "transparent", text_size = 4) + 
+  ggtitle("DE proteins")
+```
+
+Nothing in common. 
+
+
+
+
+
+
+
+# KEGG pathaway over-representation in DE proteins
+
+Now we perform KEGG pathway analysis then contrast with over-represented KEGG pathways between chambers in donors. 
+
+## KEGG pathway between LV and RV in DCM
+
+```{r}
+eprotfit$genes <- protLVRV$protDEefit$genes
+suppressWarnings(protKegga_dcm <- kegga(eprotfit, coef = "DCM", species = "Hs", geneid = "GeneID", trend = TRUE))
+# pathPval(protKegga_dcm)
+```
+
+Only one significant pathway at 5%, which is down-regulated in LV (so up in RV): 
+
+```{r}
+topKEGG(protKegga_dcm, sort = "down", number = sum(protKegga_dcm$P.Down <= 0.05)) %>% 
+  mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2)) %>% datatable
+```
+
+
+
+
+
+
+
+## KEGG pathway between LV and RV in ICM
+
+```{r, fig.width=7, fig.height=4}
+suppressWarnings(protKegga_icm <- kegga(eprotfit, coef = "ICM", species = "Hs", geneid = "GeneID", trend = TRUE))
+pathPval(protKegga_icm) + scale_fill_manual(values = brewer.pal(9, "Set1")[1:2])
+
+
+# save
+# save KEGG results into csv
+# allKEGG <- topKEGG(protKegga_icm, sort = "up", number = Inf)
+# write.csv(allKEGG, file = "tables/211105_Proteomics_ICM-LVvsRV_KEGG.csv")
+```
+
+There are multiple cardiac related pathways even just by pathway names. 
+
+
+
+- Up-regulated in LV in ICM
+
+```{r}
+protICM_Up <- topKEGG(protKegga_icm, sort = "up", 
+                      number = sum(protKegga_icm$P.Up <= 0.05)) %>% 
+  mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2))
+datatable(protICM_Up)
+```
+
+
+- Down-regulated in LV in ICM
+
+```{r}
+protICM_Down <- topKEGG(protKegga_icm, sort = "down", 
+                      number = sum(protKegga_icm$P.Down <= 0.05)) %>% 
+  mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2))
+datatable(protICM_Down)
+```
+
+
+## Compare with donor results
+
+First compare all over-represented pathways, then compare up- and down-regulated KEGG pathways separately. 
+
+```{r}
+protKEGG <- list(Donor = rownames(filter(protLVRV$protKEGG, 
+                                         P.Up < 0.05 | P.Down < 0.05)), 
+                 DCM = rownames(filter(topKEGG(protKegga_dcm, sort = "up", 
+                                               number = Inf), 
+                                       P.Up < 0.05 | P.Down < 0.05)), 
+                 ICM = rownames(filter(topKEGG(protKegga_icm, sort = "up", 
+                                               number = Inf), 
+                                       P.Up < 0.05 | P.Down < 0.05)))
+```
+
+
+### Donor vs DCM
+
+```{r, fig.height=2, fig.width=4}
+ggvenn(protKEGG[1:2], show_percentage = FALSE, 
+       fill_color = brewer.pal(6, "Dark2")[1:2], fill_alpha = 0.8, 
+       stroke_color = "transparent", text_size = 4) + 
+  ggtitle("Over-represented KEGG pathways")
+```
+
+
+- Up- and down-regulated KEGG pathways in LV: 
+
+```{r}
+protKEGG_up <- list(Donor = rownames(filter(protLVRV$protKEGG, P.Up < 0.05)), 
+                    DCM = rownames(filter(topKEGG(protKegga_dcm, sort = "up", 
+                                                  number = Inf), P.Up < 0.05)), 
+                    ICM = rownames(filter(topKEGG(protKegga_icm, sort = "up", 
+                                                  number = Inf), P.Up < 0.05)))
+protKEGG_down <- list(Donor = rownames(filter(protLVRV$protKEGG, P.Down < 0.05)), 
+                      DCM = rownames(filter(topKEGG(protKegga_dcm, sort = "up", 
+                                                    number = Inf), P.Down < 0.05)), 
+                      ICM = rownames(filter(topKEGG(protKegga_icm, sort = "up", 
+                                                    number = Inf), P.Down < 0.05)))
+```
+
+
+```{r, fig.height=2, fig.width=6}
+protKEGG_donordcmUp <- ggvenn(protKEGG_up[1:2], show_percentage = FALSE, 
+       fill_color = brewer.pal(6, "Dark2")[1:2], fill_alpha = 0.8, 
+       stroke_color = "transparent", text_size = 4) + 
+  ggtitle("Up-regulated KEGG in LV")
+protKEGG_donordcmDown <- ggvenn(protKEGG_down[1:2], show_percentage = FALSE, 
+       fill_color = brewer.pal(6, "Dark2")[1:2], fill_alpha = 0.8, 
+       stroke_color = "transparent", text_size = 4) + 
+  ggtitle("Down-regulated KEGG in LV")
+ggarrange(protKEGG_donordcmUp, protKEGG_donordcmDown, nrow = 1)
+```
+
+
+
+
+
+### Donor vs ICM
+
+```{r, fig.height=2, fig.width=4}
+ggvenn(protKEGG[c(1, 3)], show_percentage = FALSE, 
+       fill_color = brewer.pal(6, "Dark2")[c(1, 3)], fill_alpha = 0.8, 
+       stroke_color = "transparent", text_size = 4) + 
+  ggtitle("Over-represented KEGG pathways")
+```
+
+- Up- and down-regulated KEGG pathways in LV: 
+
+```{r, fig.height=2, fig.width=6}
+protKEGG_donoricmUp <- ggvenn(protKEGG_up[c(1, 3)], show_percentage = FALSE, 
+       fill_color = brewer.pal(6, "Dark2")[c(1, 3)], fill_alpha = 0.8, 
+       stroke_color = "transparent", text_size = 4) + 
+  ggtitle("Up-regulated KEGG in LV")
+protKEGG_donoricmDown <- ggvenn(protKEGG_down[c(1, 3)], show_percentage = FALSE, 
+       fill_color = brewer.pal(6, "Dark2")[c(1, 3)], fill_alpha = 0.8, 
+       stroke_color = "transparent", text_size = 4) + 
+  ggtitle("Down-regulated KEGG in LV")
+ggarrange(protKEGG_donoricmUp, protKEGG_donoricmDown, nrow = 1)
+```
+
+
+
+- Pathways in the intersection:
+
+Up-regulated intersection: 
+
+```{r}
+kable(protLVRV$protKEGG[intersect(protKEGG_up[[1]], protKEGG_up[[3]]), "Pathway"],
+      col.names = "Up-regulated in LV in both donor and ICM")
+```
+
+
+Down-regulated intersection: 
+
+```{r}
+kable(protLVRV$protKEGG[intersect(protKEGG_down[[1]], protKEGG_down[[3]]), "Pathway"],
+      col.names = "Down-regulated in LV in both donor and ICM")
+```
+
+
+
+- There is a pathway that is oppositely regulated in donor vs ICM:
+
+Relaxin signaling pathway is down-regulated in donor LV vs RV: 
+
+```{r}
+kable(protLVRV$protKEGG[setdiff(intersect(protKEGG[[1]], protKEGG[[3]]), c(intersect(protKEGG_up[[1]], protKEGG_up[[3]]), intersect(protKEGG_down[[1]], protKEGG_down[[3]]))), ])
+```
+
+
+Relaxin signaling pathway is up-regulated in ICM LV vs RV: 
+
+```{r}
+kable(protICM_Up[setdiff(intersect(protKEGG[[1]], protKEGG[[3]]), c(intersect(protKEGG_up[[1]], protKEGG_up[[3]]), intersect(protKEGG_down[[1]], protKEGG_down[[3]]))), ])
+```
+
+
+- Pathways up-regulated in donors only (n = 11)
+
+```{r}
+df_hf <- topKEGG(protKegga_icm, sort = "up", number = Inf) %>% 
+  mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2))
+getKEGGres <- function(ids, df_donor = protLVRV$protKEGG, HF = "ICM", 
+                       df_hf = df_hf, getPval_for = "P.Up") {
+  tmpDonor <- rownames_to_column(df_donor, "pathid") %>% 
+    filter(pathid %in% ids) %>% 
+    mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2)) %>% 
+    dplyr::select(pathid, Pathway, getPval_for)
+  colnames(tmpDonor)[3] <- paste("Donor", colnames(tmpDonor)[3], sep = "_")
+  tmpHF <- rownames_to_column(df_hf, "pathid") %>% 
+    filter(pathid %in% ids) %>% 
+    dplyr::select(pathid, getPval_for)
+  colnames(tmpHF)[2] <- paste(HF, colnames(tmpHF)[2], sep = "_")
+  left_join(tmpDonor, tmpHF, by = "pathid") %>% 
+    column_to_rownames("pathid")
+}
+ids <- setdiff(protKEGG_up[[1]], protKEGG_up[[3]])
+datatable(getKEGGres(ids, df_donor = protLVRV$protKEGG, HF = "ICM", 
+                       df_hf = df_hf, getPval_for = "P.Up"))
+```
+
+- Pathways up-regulated in ICM only (n = 13)
+
+```{r}
+ids <- setdiff(protKEGG_up[[3]], protKEGG_up[[1]])
+datatable(getKEGGres(ids, df_donor = protLVRV$protKEGG, HF = "ICM", 
+                       df_hf = df_hf, getPval_for = "P.Up"))
+```
+
+
+- Pathways down-regulated in donors only (n = 12)
+
+```{r}
+ids <- setdiff(protKEGG_down[[1]], protKEGG_down[[3]])
+datatable(getKEGGres(ids, df_donor = protLVRV$protKEGG, HF = "ICM", 
+                       df_hf = df_hf, getPval_for = "P.Down"))
+```
+
+- Pathways down-regulated in ICM only (n = 1)
+
+```{r}
+ids <- setdiff(protKEGG_down[[3]], protKEGG_down[[1]])
+datatable(getKEGGres(ids, df_donor = protLVRV$protKEGG, HF = "ICM", 
+                       df_hf = df_hf, getPval_for = "P.Down"))
+```
+
+
+
+
+<br><br><br><br>
+
+
+
+# Metabolite differential abundance between LV and RV in HF
+
+## MDS plots
+
+```{r, fig.height=5, fig.width=12}
+mtMDS_dcm <- ggplot() + 
+  geom_point(data = add_row(filter(metabMDS, condition != "DCM"), 
+                            filter(metabMDS, condition == "DCM")), 
+             aes(x = x, y = y, color = condition, shape = location), 
+             size = 2.8, alpha = 0.8, stroke = 0.8) + 
+  theme_classic2() + 
+  scale_shape_manual(values = c(16, 8)) + 
+  scale_color_manual(values = c(brewer.pal(8, "Greys")[4], 
+                                brewer.pal(8, "Dark2")[2], 
+                                brewer.pal(8, "Greys")[4])) + 
+  labs(x = "Leading logFC dim 1", y = "Leading logFC dim 2", 
+       color = "Condition", shape = "Location")
+mtMDS_icm <- ggplot() + 
+  geom_point(data = add_row(filter(metabMDS, condition != "ICM"), 
+                            filter(metabMDS, condition == "ICM")), 
+             aes(x = x, y = y, color = condition, shape = location), 
+             size = 2.8, alpha = 0.8, stroke = 0.8) + 
+  theme_classic2() + 
+  scale_shape_manual(values = c(16, 8)) + 
+  scale_color_manual(values = c(brewer.pal(8, "Greys")[4], 
+                                brewer.pal(8, "Greys")[4], 
+                                brewer.pal(8, "Dark2")[3])) + 
+  labs(x = "Leading logFC dim 1", y = "Leading logFC dim 2", 
+       color = "Condition", shape = "Location")
+ggarrange(mtMDS_dcm, mtMDS_icm, nrow = 1)
+```
+
+
+Not so obvious, but it seems like samples from different chambers are less similar in DCM than ICM in metabolite abundances. 
+
+
+
+## But first, compare donors to HF (combine ICM to DCM)
+
+After adjusting for log2-age, gender, diabetes and sample location: 
+
+```{r}
+# mtmeta <-  mutate(mtmeta, diseased = ifelse(condition == "Donor", "Donor", "HF")) %>% 
+  # mutate(diseased = factor(diseased, levels = c("Donor", "HF")))
+mtmeta <-  mutate(mtmeta, diseased = ifelse(condition == "Donor", "Donor", "HF")) %>% 
+  mutate(diseased = factor(diseased, levels = c("Donor", "HF"))) %>% 
+  mutate(group2 = str_c(diseased, location, sep = "_"))
+design <- model.matrix(~ 0 + group2 + log2age + sex + diabetes, data = mtmeta)
+colnames(design) <- str_remove_all(colnames(design), pattern = "group2")
+contrasts <- makeContrasts(HF_LVminusRV = HF_LV - HF_RV, levels = design)
+```
+
+```{r}
+metab <- t(metab)
+suppressWarnings(dupcor <- duplicateCorrelation(metab, design, block = mtmeta$bank))
+correlations <- smooth_genewise_cor(metab, dupcor)
+mtfit <- lmFit2(metab, design, block = mtmeta$bank, correlation = correlations)
+mtfit <- contrasts.fit(mtfit, contrasts = contrasts)
+emtfit <- eBayes(mtfit)
+kable(summary(decideTests(emtfit)))
+```
+
+```{r}
+tmpDF <- data.frame(class = c("Up", "Down", "NotSig"), 
+                    count = c(4, 1, 95)) %>% 
+  mutate(class = factor(class, levels = c("Up", "Down", "NotSig")))
+ggplot(tmpDF, aes(x = class, y = count, fill = class)) + 
+  geom_col(show.legend = FALSE) + 
+  geom_text(aes(label = count), position = position_dodge(width = 1), vjust = -0.4, size = 4) + 
+  theme_linedraw() +
+  scale_fill_manual(values = brewer.pal(9, "Set1")[c(1:2, 9)]) + 
+  labs(x = "DA status", y = "Count")
+```
+
+
+
+And what are these metabolites:
+
+```{r}
+HF_vs_Donor_metab <- topTable(emtfit, coef = "HF_LVminusRV", number = Inf) %>% signif(2) %>% 
+  rownames_to_column("name") %>% 
+  left_join(metabLVRV$metab_anno, by = "name") %>% 
+  dplyr::select(KEGG, HMDB, everything()) %>% 
+  column_to_rownames("name") %>% 
+  filter(!is.na(logFC)) %>% 
+  arrange(adj.P.Val)
+datatable(HF_vs_Donor_metab, width = "95%", options = list(scrollX = TRUE))
+
+# save
+# write.csv(HF_vs_Donor_metab, file = "tables/211105_Metabolomics_HF_LVvsRV_DE.csv")
+```
+
+
+
+Volcano plot:
+
+```{r, fig.height=4, fig.width=7}
+HF_vs_Donor_metab_dt <- data.frame(decideTests(emtfit)) %>% 
+  rownames_to_column("name")
+HF_vs_Donor_metab_vol <- rownames_to_column(HF_vs_Donor_metab, "name") %>%
+  mutate(logP = -log10(adj.P.Val)) %>% 
+  left_join(dplyr::select(HF_vs_Donor_metab_dt, name, HF_LVminusRV), by = "name") %>% 
+  mutate(HF_LVminusRV = factor(HF_LVminusRV, levels = c(1, -1, 0))) %>% 
+  filter(!is.na(logFC))
+levels(HF_vs_Donor_metab_vol$HF_LVminusRV) <- c("Up", "Down", "Not significant")
+
+ggplot(HF_vs_Donor_metab_vol, aes(x = logFC, y = -log10(adj.P.Val), color = HF_LVminusRV)) + 
+  geom_point(size = 0.8) + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", size = 0.4) + 
+  geom_text_repel(data = filter(HF_vs_Donor_metab_vol, logP > 1.3), show.legend = FALSE, 
+            aes(label = name), size = 2.8, color = "black") + 
+  theme_bw() +
+  scale_color_manual(values = brewer.pal(9, "Set1")[c(1:2, 9)]) + 
+  labs(x = "log2FC(LV/RV in HF)", y = "-log10P", color = "DAM")
+```
+
+
+
+Compare with the list of proteins differentially expressed in donors LV vs RV:
+
+```{r}
+donorOnly <- data.frame(decideTests(metabLVRV$metabDEefit)) %>% 
+  add_column(data.frame(decideTests(emtfit))) %>% rownames_to_column("name")
+# as list
+donor_vs_HF_metab <- list(donorLVvsRV = na.omit(donorOnly$name[donorOnly$donor != 0]), 
+                    Up_donorLVvsRV = na.omit(donorOnly$name[donorOnly$donor == 1]), 
+                    Down_donorLVvsRV = na.omit(donorOnly$name[donorOnly$donor == -1]), 
+                    HFvsDonor = na.omit(donorOnly$name[donorOnly$HF_LVminusRV != 0]), 
+                    Up_HFmDonor = na.omit(donorOnly$name[donorOnly$HF_LVminusRV == 1]), 
+                    Down_HFmDonor = na.omit(donorOnly$name[donorOnly$HF_LVminusRV == -1]))
+# sapply(donor_vs_HF_metab, length)
+
+ggvenn(donor_vs_HF_metab[c(4, 1)], show_percentage = FALSE, 
+       fill_color = c("#1B9E77", "#BEBADA"), fill_alpha = 0.8, 
+       stroke_color = "transparent", text_size = 6) + 
+  ggtitle("DA metabolites")
+
+# save the list
+df_save <- matrix(NA, nrow = 24, ncol = 3) %>% as.data.frame
+colnames(df_save) <- c("DA in only donor", "DA in only HF", "DA in both donor and HF")
+df_save$`DA in only donor` <- setdiff(donor_vs_HF_metab$donorLVvsRV, donor_vs_HF_metab$HFvsDonor)
+df_save$`DA in only HF`[1:4] <- setdiff(donor_vs_HF_metab$HFvsDonor, donor_vs_HF_metab$donorLVvsRV)
+df_save$`DA in both donor and HF`[1] <- intersect(donor_vs_HF_metab$HFvsDonor, donor_vs_HF_metab$donorLVvsRV)
+# write.csv(df_save, file = "tables/211105_Metabolomics_Donor-vs-HF_DA_lists.csv")
+
+# we want these in the intersection
+toLook <- filter(HF_vs_Donor_metab_vol, name %in% intersect(donor_vs_HF_metab$donorLVvsRV, 
+                                                            donor_vs_HF_metab$HFvsDonor))
+donorMetab <- metabLVRV$metabDE
+
+gatherDEstats_metab0 <- function(ind, HF = HF_vs_Donor_metab, cond = "HF_LVminusRV") {
+  tmpDonor <- rownames_to_column(donorMetab, "name") %>% 
+    filter(name %in% ind) %>% 
+    dplyr::select(-B, -AveExpr, -P.Value, -t) %>% 
+    dplyr::rename(donor_logFC = logFC, donor_adj.P.Val = adj.P.Val)
+  tmpHF <- rownames_to_column(HF, "name") %>% 
+    filter(name %in% ind) %>% 
+    dplyr::select(-KEGG, -HMDB, -B, -AveExpr, -P.Value, -t)
+  colnames(tmpHF)[-1] <- paste(cond, colnames(tmpHF)[-1], sep = "_")
+  left_join(tmpDonor, tmpHF, by = "name") %>% column_to_rownames("name")
+}
+
+datatable(gatherDEstats_metab0(ind = toLook$name, HF = HF_vs_Donor_metab, cond = "HF_LVminusRV"), 
+          width = "95%", options = list(scrollX = TRUE))
+```
+
+
+
+
+- Compare the logFC:
+
+```{r, fig.height=5, fig.width=7}
+metab_HFvsdonor <- gatherDEstats_metab0(ind = toLook$name, HF = HF_vs_Donor_metab, cond = "HF_LVminusRV") %>% 
+  mutate(class = ifelse(sign(donor_logFC) == sign(HF_LVminusRV_logFC), "Same", "Opposite")) %>% 
+  rownames_to_column("name")
+table(metab_HFvsdonor$class)
+
+ggplot(data = filter(metab_HFvsdonor, class == "Same"), 
+       aes(x = donor_logFC, y = HF_LVminusRV_logFC, color = class)) + 
+  geom_hline(yintercept = 0, color = "#a6a6a6", linetype = "dashed") + 
+  geom_vline(xintercept = 0, color = "#a6a6a6", linetype = "dashed") + 
+  geom_point(size = 0.8) +
+  annotate("rect", xmin = -Inf, xmax = 0, ymin = 0, ymax = Inf, 
+           fill = "#a6a6a6", alpha = 0.15) + 
+  annotate("rect", xmin = 0, xmax = Inf, ymin = -Inf, ymax = 0, 
+           fill = "#a6a6a6", alpha = 0.15) + 
+  geom_abline(slope = 1, intercept = 0, color = "#a6a6a6", linetype = "dashed") + 
+  geom_point(data = filter(metab_HFvsdonor, class == "Opposite"), alpha = 0.8, 
+             aes(x = donor_logFC, y = HF_LVminusRV_logFC, color = class), size = 1.2) + 
+  geom_text_repel(data = filter(metab_HFvsdonor, class == "Opposite"), 
+                  position = position_nudge(x = 0.02, y = 0.02),
+                  aes(label = name), size = 2.8, 
+                  show.legend = FALSE, color = "black") + 
+  scale_color_manual(values = c("#FDB462", "#999999")) + 
+  theme_bw() +
+  labs(x = "log2FC(LV/RV in donors)", y = "log2FC(LV/RV in HF)", color = "DA direction")
+```
+
+
+Only one metabolite in the intersection, plot boxplots instead: 
+
+```{r}
+# Adenosine
+thisMetab <- data.frame(Adenosine = metab["Adenosine", ]) %>% 
+  rownames_to_column("locBank") %>% 
+  left_join(mtmeta, by = "locBank") %>% 
+  mutate(diseased = as.factor(diseased), location = as.factor(location))
+
+ggplot(thisMetab, aes(x = diseased, y = Adenosine, fill = location)) + 
+  geom_boxplot() + 
+  theme_linedraw()
+
+thisMetab <- data.frame(thismtb = metab["Aspartic acid", ]) %>% 
+  rownames_to_column("locBank") %>% 
+  left_join(mtmeta, by = "locBank") %>% 
+  filter(condition == "Donor")
+ggplot(thisMetab, aes(x = location, y = thismtb, fill = sex)) + 
+  geom_boxplot() + 
+  theme_linedraw() + 
+  ggtitle("Aspartic acid")
+
+thisMetab <- data.frame(thismtb = metab["Fructose 6-phosphate", ]) %>% 
+  rownames_to_column("locBank") %>% 
+  left_join(mtmeta, by = "locBank") %>% 
+  filter(condition == "Donor")
+ggplot(thisMetab, aes(x = location, y = thismtb, fill = sex)) + 
+  geom_boxplot() + 
+  theme_linedraw() + 
+  ggtitle("Fructose 6-phosphate")
+
+thisMetab <- data.frame(thismtb = metab["Erythrose 4-phosphate", ]) %>% 
+  rownames_to_column("locBank") %>% 
+  left_join(mtmeta, by = "locBank") %>% 
+  filter(condition == "Donor")
+ggplot(thisMetab, aes(x = location, y = thismtb, fill = sex)) + 
+  geom_boxplot() + 
+  theme_linedraw() + 
+  ggtitle("Erythrose 4-phosphate")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## DE summary in each condition
+
+```{r}
+design <- model.matrix(~ 0 + group + log2age + sex + diabetes, data = mtmeta)
+colnames(design)[1:6] <- str_sub(colnames(design)[1:6], start = 6)
+contrasts <- makeContrasts(DCM = DCM_LV - DCM_RV, 
+                           ICM = ICM_LV - ICM_RV, levels = design)
+```
+
+
+```{r}
+suppressWarnings(dupcor <- duplicateCorrelation(metab, design, block = mtmeta$bank))
+correlations <- smooth_genewise_cor(metab, dupcor)
+mtfit <- lmFit2(metab, design, block = mtmeta$bank, correlation = correlations)
+mtfit <- contrasts.fit(mtfit, contrasts = contrasts)
+emtfit <- eBayes(mtfit)
+kable(summary(decideTests(emtfit)))
+```
+
+Not so many differentially abundant metabolites. Compare with the numbers from the donor analysis: 
+
+```{r}
+kable(summary(decideTests(metabLVRV$metabDEefit)))
+```
+
+Just like the proteomics analysis, the two chambers are less differentiated in HF. 
+
+
+
+
+
+## DCM DE list
+
+- Only 1 significantly differentially expressed proteins between chambers in DCM, which is acetoacetic acid and is down-regulated in LV. 
+
+```{r}
+dcmMetab <- topTable(emtfit, coef = "DCM", number = Inf) %>% signif(2) %>% 
+  rownames_to_column("name") %>% 
+  left_join(metabLVRV$metab_anno, by = "name") %>% 
+  dplyr::select(KEGG, HMDB, everything()) %>% 
+  column_to_rownames("name") %>% 
+  filter(!is.na(logFC)) %>% 
+  arrange(adj.P.Val)
+datatable(dcmMetab, width = "95%", options = list(scrollX = TRUE))
+
+# save
+# write.csv(dcmMetab, file = "tables/211105_Metabolomics_DCM_LVvsRV_DE.csv")
+```
+
+- Volcano plot: 
+
+```{r, fig.height=4, fig.width=7}
+dtMetab <- data.frame(decideTests(emtfit)) %>% 
+  rownames_to_column("name")
+dcmMetab_vol <- rownames_to_column(dcmMetab, "name") %>%
+  mutate(logP = -log10(adj.P.Val)) %>% 
+  left_join(dplyr::select(dtMetab, name, DCM), by = "name") %>% 
+  mutate(DCM = factor(DCM, levels = c(1, -1, 0))) %>% 
+  filter(!is.na(logFC))
+levels(dcmMetab_vol$DCM) <- c("Up", "Down", "Not significant")
+
+ggplot(dcmMetab_vol, aes(x = logFC, y = -log10(adj.P.Val), color = DCM)) + 
+  geom_point(size = 0.8) + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", size = 0.4) + 
+  geom_text_repel(data = filter(dcmMetab_vol, adj.P.Val < 0.05), show.legend = FALSE, 
+            aes(label = name), size = 2.8, color = "black") + 
+  theme_bw() +
+  scale_color_manual(values = brewer.pal(9, "Set1")[c(2, 9)]) + 
+  labs(x = "log2FC", y = "-log10(P-value)", color = "DEP")
+```
+
+
+
+## ICM DE list
+
+```{r}
+icmMetab <- topTable(emtfit, coef = "ICM", number = Inf) %>% signif(2) %>% 
+  rownames_to_column("name") %>% 
+  left_join(metabLVRV$metab_anno, by = "name") %>% 
+  dplyr::select(KEGG, HMDB, everything()) %>% 
+  column_to_rownames("name") %>% 
+  filter(!is.na(logFC)) %>% 
+  arrange(adj.P.Val)
+datatable(icmMetab, width = "95%", options = list(scrollX = TRUE))
+
+# save
+# write.csv(icmMetab, file = "tables/211105_Metabolomics_ICM_LVvsRV_DE.csv")
+```
+
+
+- Volcano plot: 
+
+```{r, fig.height=4, fig.width=7}
+icmMetab_vol <- rownames_to_column(icmMetab, "name") %>%
+  mutate(logP = -log10(adj.P.Val)) %>% 
+  left_join(dplyr::select(dtMetab, name, ICM), by = "name") %>% 
+  mutate(ICM = factor(ICM, levels = c(1, -1, 0))) %>% 
+  filter(!is.na(logFC))
+levels(icmMetab_vol$ICM) <- c("Up", "Down", "Not significant")
+
+ggplot(icmMetab_vol, aes(x = logFC, y = -log10(adj.P.Val), color = ICM)) + 
+  geom_point(size = 0.8) + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", size = 0.4) + 
+  geom_text_repel(data = filter(icmMetab_vol, adj.P.Val < 0.05), show.legend = FALSE, 
+            aes(label = name), size = 2.8, color = "black") + 
+  theme_bw() +
+  scale_color_manual(values = brewer.pal(9, "Set1")[c(1, 2, 9)]) + 
+  labs(x = "log2FC", y = "-log10(P-value)", color = "DEP")
+```
+
+
+
+
+
+
+
+
+## Compare with differential expression in donors
+
+```{r}
+all_metabdt <- data.frame(decideTests(metabLVRV$metabDEefit)) %>% 
+  add_column(data.frame(decideTests(emtfit))) %>% 
+  rownames_to_column("name")
+all_metabDE <- mutate(all_metabdt, donor = abs(donor), 
+                      DCM = abs(DCM), ICM = abs(ICM))
+```
+
+
+### DCM vs Donor
+
+
+```{r, fig.height=2, fig.width=2.5}
+metabDE <- list(Donor = all_metabDE$name[all_metabDE$donor == 1], 
+                DCM = all_metabDE$name[all_metabDE$DCM == 1], 
+                ICM = all_metabDE$name[all_metabDE$ICM == 1])
+metabDE <- lapply(metabDE, function(x) x[!is.na(x)])
+
+ggvenn(metabDE[1:2], show_percentage = FALSE, 
+       fill_color = brewer.pal(6, "Dark2")[1:2], fill_alpha = 0.8, 
+       stroke_color = "transparent", text_size = 4) + 
+  ggtitle("DA metabolites")
+
+# save the list
+df_save <- matrix(NA, nrow = 24, ncol = 2) %>% as.data.frame
+colnames(df_save) <- c("DA in only donor", "DA in both donor and DCM")
+df_save$`DA in only donor` <- setdiff(metabDE$Donor, metabDE$DCM)
+df_save$`DA in both donor and DCM`[1] <- intersect(metabDE$Donor, metabDE$DCM)
+# write.csv(df_save, file = "tables/211105_Metabolomics_Donor-vs-DCM_DA_lists.csv")
+```
+
+
+- The only differentially abundant metabolite between chambers in DCM is also down-regulated in LV donors: 
+
+```{r}
+donorMetab <- metabLVRV$metabDE
+ind <- filter(all_metabdt, name %in% intersect(metabDE$Donor, metabDE$DCM)) %>% 
+  dplyr::select(-ICM)
+```
+
+
+
+```{r}
+gatherDEstats_metab <- function(ind, HF = dcmMetab, cond = "DCM") {
+  tmpDonor <- rownames_to_column(donorMetab, "name") %>% 
+    filter(name %in% ind) %>% 
+    dplyr::select(-B, -AveExpr, -P.Value, -t) %>% 
+    dplyr::rename(donor_logFC = logFC, donor_adj.P.Val = adj.P.Val)
+  tmpHF <- rownames_to_column(HF, "name") %>% 
+    filter(name %in% ind) %>% 
+    dplyr::select(-KEGG, -HMDB, -B, -AveExpr, -P.Value, -t)
+  colnames(tmpHF)[-1] <- paste(cond, colnames(tmpHF)[-1], sep = "_")
+  left_join(tmpDonor, tmpHF, by = "name") %>% column_to_rownames("name")
+}
+
+datatable(gatherDEstats_metab(ind$name, HF = dcmMetab, cond = "DCM"), 
+          width = "95%", options = list(scrollX = TRUE))
+```
+
+
+
+- All other DA metabolites in LV vs RV in donors are no longer DA in DCM: 
+
+```{r}
+ind <- filter(all_metabdt, name %in% setdiff(metabDE$Donor, metabDE$DCM)) %>% 
+  dplyr::select(-ICM)
+datatable(gatherDEstats_metab(ind$name, HF = dcmMetab, cond = "DCM"), 
+          width = "95%", options = list(scrollX = TRUE))
+```
+
+
+
+- Compare the logFC:
+
+```{r, fig.height=5, fig.width=7}
+metab_dcmVSdonor <- gatherDEstats_metab(rownames(donorMetab), 
+                                        HF = dcmMetab, cond = "DCM") %>%
+  rownames_to_column("name") %>% 
+  left_join(all_metabdt, by = "name") %>% 
+  dplyr::select(name, donor_logFC, DCM_logFC, donor, DCM) %>% 
+  mutate(class = abs(donor) + abs(DCM)) %>% 
+  mutate(class = ifelse(donor != 0 & class == 1, "Donor", class), 
+         class = ifelse(DCM != 0 & class == 1, "DCM", class), 
+         class = ifelse(class == 2, "Both DCM and donor", class), 
+         class = ifelse(class == 0, "Insignificant", class)) %>% 
+  dplyr::select(-donor, -DCM) %>% 
+  mutate(class = factor(class, levels = c("Both DCM and donor", 
+                                          "Donor", "DCM", "Insignificant")))
+
+ggplot(data = filter(metab_dcmVSdonor, class == "Insignificant"), 
+       aes(x = donor_logFC, y = DCM_logFC, color = class)) + 
+  geom_hline(yintercept = 0, color = "#a6a6a6", linetype = "dashed") + 
+  geom_vline(xintercept = 0, color = "#a6a6a6", linetype = "dashed") + 
+  geom_point(size = 1) +
+  annotate("rect", xmin = -Inf, xmax = 0, ymin = 0, ymax = Inf, 
+           fill = "#a6a6a6", alpha = 0.15) + 
+  annotate("rect", xmin = 0, xmax = Inf, ymin = -Inf, ymax = 0, 
+           fill = "#a6a6a6", alpha = 0.15) + 
+  geom_point(data = filter(metab_dcmVSdonor, class == "Donor"), alpha = 0.8, 
+             aes(x = donor_logFC, y = DCM_logFC, color = class), size = 1) + 
+  geom_point(data = filter(metab_dcmVSdonor, class %in% c("DCM", 
+                                                         "Both DCM and donor")), 
+             aes(x = donor_logFC, y = DCM_logFC, color = class), size = 2, 
+             alpha = 1) + 
+  geom_abline(slope = 1, intercept = 0, color = "#a6a6a6", linetype = "dashed") + 
+  geom_text_repel(data = filter(metab_dcmVSdonor, 
+                                class %in% c("Both DCM and donor", "DCM")), 
+                  position = position_nudge(x = 0.1, y = -0.01),
+                  aes(label = name), size = 2.8, 
+                  show.legend = FALSE, color = "black") + 
+  scale_color_manual(values = c("#FDB462", "#1B9E77", "#a6a6a6")) + 
+  theme_bw() +
+  labs(x = "log2FC (donor)", y = "log2FC (DCM)", color = "Significant in")
+```
+
+
+
+
+
+
+### ICM vs Donor
+
+```{r, fig.height=2, fig.width=2.5}
+ggvenn(metabDE[c(1, 3)], show_percentage = FALSE, 
+       fill_color = brewer.pal(6, "Dark2")[c(1, 3)], fill_alpha = 0.8, 
+       stroke_color = "transparent", text_size = 4) + 
+  ggtitle("DA metabolites")
+
+# save the list
+df_save <- matrix(NA, nrow = 24, ncol = 3) %>% as.data.frame
+colnames(df_save) <- c("DA in only donor", "DA in only ICM", "DA in both donor and ICM")
+df_save$`DA in only donor` <- setdiff(metabDE$Donor, metabDE$ICM)
+df_save$`DA in only ICM`[1:2] <- setdiff(metabDE$ICM, metabDE$Donor)
+df_save$`DA in both donor and ICM`[1] <- intersect(metabDE$ICM, metabDE$Donor)
+# write.csv(df_save, file = "tables/211105_Metabolomics_Donor-vs-ICM_DA_lists.csv")
+```
+
+- Out of the only three DA metabolites between chambers in ICM, only 1 is also DA in donors. However, they have opposite directions in ICM and donors: 
+
+```{r}
+ind <- filter(all_metabdt, name %in% intersect(metabDE$Donor, metabDE$ICM))
+kable(gatherDEstats_metab(ind$name, HF = icmMetab, cond = "ICM"))
+```
+
+
+- The two DA metabolites unique to ICM: 
+
+```{r}
+ind <- filter(all_metabdt, name %in% setdiff(metabDE$ICM, metabDE$Donor))
+datatable(gatherDEstats_metab(ind$name, HF = icmMetab, cond = "ICM"), 
+          width = "95%", options = list(scrollX = TRUE))
+```
+
+
+- Metabolites that are no longer DA in ICM but are DA in donors:
+
+```{r}
+ind <- filter(all_metabdt, name %in% setdiff(metabDE$Donor, metabDE$ICM))
+datatable(gatherDEstats_metab(ind$name, HF = icmMetab, cond = "ICM"), 
+          width = "95%", options = list(scrollX = TRUE))
+```
+
+
+- Compare the logFC:
+
+```{r, fig.height=5, fig.width=7}
+metab_icmVSdonor <- gatherDEstats_metab(rownames(donorMetab), 
+                                        HF = icmMetab, cond = "ICM") %>%
+  rownames_to_column("name") %>% 
+  left_join(all_metabdt, by = "name") %>% 
+  dplyr::select(name, donor_logFC, ICM_logFC, donor, ICM) %>% 
+  mutate(class = abs(donor) + abs(ICM)) %>% 
+  mutate(class = ifelse(donor != 0 & class == 1, "Donor", class), 
+         class = ifelse(ICM != 0 & class == 1, "ICM", class), 
+         class = ifelse(class == 2, "Both ICM and donor", class), 
+         class = ifelse(class == 0, "Insignificant", class)) %>% 
+  dplyr::select(-donor, -ICM) %>% 
+  mutate(class = factor(class, levels = c("Both ICM and donor", 
+                                          "Donor", "ICM", "Insignificant")))
+
+ggplot(data = filter(metab_icmVSdonor, class == "Insignificant"), 
+       aes(x = donor_logFC, y = ICM_logFC, color = class)) + 
+  geom_hline(yintercept = 0, color = "#a6a6a6", linetype = "dashed") + 
+  geom_vline(xintercept = 0, color = "#a6a6a6", linetype = "dashed") + 
+  geom_point(size = 1) +
+  annotate("rect", xmin = -Inf, xmax = 0, ymin = 0, ymax = Inf, 
+           fill = "#a6a6a6", alpha = 0.15) + 
+  annotate("rect", xmin = 0, xmax = Inf, ymin = -Inf, ymax = 0, 
+           fill = "#a6a6a6", alpha = 0.15) + 
+  geom_point(data = filter(metab_icmVSdonor, class == "Donor"), alpha = 0.8, 
+             aes(x = donor_logFC, y = ICM_logFC, color = class), size = 1) + 
+  geom_point(data = filter(metab_icmVSdonor, class %in% c("ICM", 
+                                                         "Both ICM and donor")), 
+             aes(x = donor_logFC, y = ICM_logFC, color = class), size = 2, 
+             alpha = 1) + 
+  geom_abline(slope = 1, intercept = 0, color = "#a6a6a6", linetype = "dashed") + 
+  geom_text_repel(data = filter(metab_icmVSdonor, 
+                                class %in% c("Both ICM and donor", "ICM")), 
+                  position = position_nudge(x = 0.1, y = -0.01),
+                  aes(label = name), size = 2.8, 
+                  show.legend = FALSE, color = "black") + 
+  scale_color_manual(values = c("#FDB462", "#1B9E77", "#7570B3", "#a6a6a6")) + 
+  theme_bw() +
+  labs(x = "log2FC (donor)", y = "log2FC (ICM)", color = "Significant in")
+```
+
+
+
+### DCM vs ICM
+
+```{r, fig.height=2, fig.width=2.5}
+ggvenn(metabDE[2:3], show_percentage = FALSE, 
+       fill_color = brewer.pal(6, "Dark2")[2:3], fill_alpha = 0.8, 
+       stroke_color = "transparent", text_size = 4) + 
+  ggtitle("DA metabolites")
+```
+
+Nothing in common. 
+
+
+# KEGG pathaway over-representation in DA metabolites
+
+Now we perform KEGG pathway analysis then contrast with over-represented KEGG pathways between chambers in donors. Mean-rank gene set test using t-statistics for metabolites to test for over-representation in KEGG pathways. 
+
+
+
+
+## KEGG pathway between LV and RV in DCM
+
+```{r}
+# pathway names
+ref <- keggList("pathway", "hsa")
+keggNames <- data.frame(name = ref) %>% rownames_to_column(var = "Pathway") %>% 
+  mutate(name = str_sub(name, end = -24))
+# cpd to pathway downloaded from http://rest.kegg.jp/link/cpd/pathway
+cpd <- read_tsv(here("data/kegg/210904_kegg_cpd_to_pathway.txt"), col_types = cols(), col_names = FALSE)
+colnames(cpd) <- c("Pathway", "Compound")
+cpd <- mutate(cpd, Pathway = str_replace(Pathway, "map", "hsa"), 
+              Compound = str_sub(Compound, start = 5))
+```
+
+
+- Up-regulated KEGG in LV in DCM
+
+```{r}
+# up-regulation
+decpds <- rownames_to_column(dcmMetab, "name") %>% 
+  dplyr::select(name, KEGG, t, logFC) %>% 
+  filter(!is.na(KEGG)) %>% 
+  filter(logFC > 0)
+mtb_rank <- decpds$t; names(mtb_rank) <- decpds$KEGG
+pathway_presence <- lapply(keggNames$Pathway, function(i) {
+  pathi <- filter(cpd, Pathway == i)
+  return(names(mtb_rank) %in% pathi$Compound)
+}) %>% do.call(cbind, .)
+rownames(pathway_presence) <- decpds$KEGG
+mtb_kegg_up <- data.frame(Pathway = keggNames$Pathway, 
+                          P.value = apply(pathway_presence, 2, function (x) geneSetTest(index = x, statistics = mtb_rank)))
+mtb_kegg_up <- mutate(mtb_kegg_up, P.value = signif(P.value, 2)) %>% 
+  arrange(P.value) %>% 
+  left_join(keggNames, by = "Pathway") %>% 
+  dplyr::select(Pathway, name, P.value) %>% 
+  column_to_rownames("Pathway") %>% 
+  dplyr::rename(Pathway = name)
+datatable(mtb_kegg_up)
+```
+
+
+- Down-regulated KEGG in LV in DCM
+
+```{r}
+decpds <-  rownames_to_column(dcmMetab, "name") %>% 
+  dplyr::select(name, KEGG, t, logFC) %>% 
+  filter(!is.na(KEGG)) %>% 
+  filter(logFC < 0)
+mtb_rank <- decpds$t; names(mtb_rank) <- decpds$KEGG
+pathway_presence <- lapply(keggNames$Pathway, function(i) {
+  pathi <- filter(cpd, Pathway == i)
+  return(names(mtb_rank) %in% pathi$Compound)
+}) %>% do.call(cbind, .)
+rownames(pathway_presence) <- decpds$KEGG
+mtb_kegg_down <- data.frame(Pathway = keggNames$Pathway, 
+                       P.value = apply(pathway_presence, 2, function (x) geneSetTest(index = x, statistics = mtb_rank)))
+mtb_kegg_down <- mutate(mtb_kegg_down, P.value = signif(P.value, 2)) %>% 
+  arrange(P.value) %>% 
+  left_join(keggNames, by = "Pathway") %>% 
+  dplyr::select(Pathway, name, P.value) %>% 
+  column_to_rownames("Pathway") %>% 
+  dplyr::rename(Pathway = name)
+datatable(mtb_kegg_down)
+```
+
+
+
+```{r, fig.width=7, fig.height=4}
+metabKegg_dcm <- dplyr::rename(mtb_kegg_up, P.Up = P.value) %>% 
+  left_join(mtb_kegg_down, by = "Pathway") %>% 
+  dplyr::rename(P.Down = P.value)
+pathPval2(metabKegg_dcm) + scale_fill_manual(values = brewer.pal(9, "Set1")[1:2])
+```
+
+
+
+## KEGG pathway between LV and RV in ICM
+
+- Up-regulated KEGG in LV in ICM
+
+```{r}
+# up-regulation
+decpds <- rownames_to_column(icmMetab, "name") %>% 
+  dplyr::select(name, KEGG, t, logFC) %>% 
+  filter(!is.na(KEGG)) %>% 
+  filter(logFC > 0)
+mtb_rank <- decpds$t; names(mtb_rank) <- decpds$KEGG
+pathway_presence <- lapply(keggNames$Pathway, function(i) {
+  pathi <- filter(cpd, Pathway == i)
+  return(names(mtb_rank) %in% pathi$Compound)
+}) %>% do.call(cbind, .)
+rownames(pathway_presence) <- decpds$KEGG
+mtb_kegg_up <- data.frame(Pathway = keggNames$Pathway, 
+                          P.value = apply(pathway_presence, 2, function (x) geneSetTest(index = x, statistics = mtb_rank)))
+mtb_kegg_up <- mutate(mtb_kegg_up, P.value = signif(P.value, 2)) %>% 
+  arrange(P.value) %>% 
+  left_join(keggNames, by = "Pathway") %>% 
+  dplyr::select(Pathway, name, P.value) %>% 
+  column_to_rownames("Pathway") %>% 
+  dplyr::rename(Pathway = name)
+datatable(mtb_kegg_up)
+```
+
+
+- Down-regulated KEGG in LV in ICM
+
+```{r}
+decpds <-  rownames_to_column(icmMetab, "name") %>% 
+  dplyr::select(name, KEGG, t, logFC) %>% 
+  filter(!is.na(KEGG)) %>% 
+  filter(logFC < 0)
+mtb_rank <- decpds$t; names(mtb_rank) <- decpds$KEGG
+pathway_presence <- lapply(keggNames$Pathway, function(i) {
+  pathi <- filter(cpd, Pathway == i)
+  return(names(mtb_rank) %in% pathi$Compound)
+}) %>% do.call(cbind, .)
+rownames(pathway_presence) <- decpds$KEGG
+mtb_kegg_down <- data.frame(Pathway = keggNames$Pathway, 
+                       P.value = apply(pathway_presence, 2, function (x) geneSetTest(index = x, statistics = mtb_rank)))
+mtb_kegg_down <- mutate(mtb_kegg_down, P.value = signif(P.value, 2)) %>% 
+  arrange(P.value) %>% 
+  left_join(keggNames, by = "Pathway") %>% 
+  dplyr::select(Pathway, name, P.value) %>% 
+  column_to_rownames("Pathway") %>% 
+  dplyr::rename(Pathway = name)
+datatable(mtb_kegg_down)
+```
+
+
+```{r, fig.width=7, fig.height=6}
+metabKegg_icm <- dplyr::rename(mtb_kegg_up, P.Up = P.value) %>% 
+  left_join(mtb_kegg_down, by = "Pathway") %>% 
+  dplyr::rename(P.Down = P.value)
+pathPval2(metabKegg_icm) + scale_fill_manual(values = brewer.pal(9, "Set1")[1:2])
+```
+
+
+
+
+## Compare with donor results
+
+First compare all over-represented pathways, then compare up- and down-regulated KEGG pathways separately. 
+
+```{r}
+metabKEGG <- list(Donor = filter(metabLVRV$metabKEGG, 
+                                 P.Up < 0.05 | P.Down < 0.05)$Pathway, 
+                 DCM = filter(metabKegg_dcm, P.Up < 0.05 | P.Down < 0.05)$Pathway, 
+                 ICM = filter(metabKegg_icm, P.Up < 0.05 | P.Down < 0.05)$Pathway)
+metabKEGG <- list(Donor = filter(metabLVRV$metabKEGG, 
+                                 P.Up < 0.05 | P.Down < 0.05)$Pathway, 
+                 DCM = filter(metabKegg_dcm, P.Up < 0.05 | P.Down < 0.05)$Pathway, 
+                 ICM = filter(metabKegg_icm, P.Up < 0.05 | P.Down < 0.05)$Pathway)
+```
+
+
+### Donor vs DCM
+
+```{r, fig.height=2, fig.width=2.5}
+ggvenn(metabKEGG[1:2], show_percentage = FALSE, 
+       fill_color = brewer.pal(6, "Dark2")[1:2], fill_alpha = 0.8, 
+       stroke_color = "transparent", text_size = 4) + 
+  ggtitle("Over-represented KEGG pathways")
+```
+
+Nothing in common. 
+
+- Up- and down-regulated KEGG pathways in LV: 
+
+```{r}
+metabKEGG_up <- list(Donor = filter(metabLVRV$metabKEGG, P.Up < 0.05)$Pathway, 
+                     DCM = filter(metabKegg_dcm, P.Up < 0.05)$Pathway, 
+                     ICM = filter(metabKegg_icm, P.Up < 0.05)$Pathway)
+metabKEGG_down <- list(Donor = filter(metabLVRV$metabKEGG, P.Down < 0.05)$Pathway, 
+                     DCM = filter(metabKegg_dcm, P.Down < 0.05)$Pathway, 
+                     ICM = filter(metabKegg_icm, P.Down < 0.05)$Pathway)
+```
+
+
+```{r, fig.height=2, fig.width=6}
+metabKEGG_donordcmUp <- ggvenn(metabKEGG_up[1:2], show_percentage = FALSE, 
+       fill_color = brewer.pal(6, "Dark2")[1:2], fill_alpha = 0.8, 
+       stroke_color = "transparent", text_size = 4) + 
+  ggtitle("Up-regulated KEGG in LV")
+metabKEGG_donordcmDown <- ggvenn(metabKEGG_down[1:2], show_percentage = FALSE, 
+       fill_color = brewer.pal(6, "Dark2")[1:2], fill_alpha = 0.8, 
+       stroke_color = "transparent", text_size = 4) + 
+  ggtitle("Down-regulated KEGG in LV")
+ggarrange(metabKEGG_donordcmUp, metabKEGG_donordcmDown, nrow = 1)
+```
+
+
+
+
+### Donor vs ICM
+
+```{r, fig.height=2, fig.width=2.5}
+ggvenn(metabKEGG[c(1, 3)], show_percentage = FALSE, 
+       fill_color = brewer.pal(6, "Dark2")[c(1, 3)], fill_alpha = 0.8, 
+       stroke_color = "transparent", text_size = 4) + 
+  ggtitle("Over-represented KEGG pathways")
+```
+
+
+- Up- and down-regulated KEGG pathways in LV: 
+
+```{r, fig.height=2, fig.width=6}
+metabKEGG_donoricmUp <- ggvenn(metabKEGG_up[c(1, 3)], show_percentage = FALSE, 
+       fill_color = brewer.pal(6, "Dark2")[c(1, 3)], fill_alpha = 0.8, 
+       stroke_color = "transparent", text_size = 4) + 
+  ggtitle("Up-regulated KEGG in LV")
+metabKEGG_donoricmDown <- ggvenn(metabKEGG_down[c(1, 3)], show_percentage = FALSE, 
+       fill_color = brewer.pal(6, "Dark2")[c(1, 3)], fill_alpha = 0.8, 
+       stroke_color = "transparent", text_size = 4) + 
+  ggtitle("Down-regulated KEGG in LV")
+ggarrange(metabKEGG_donoricmUp, metabKEGG_donoricmDown, nrow = 1)
+```
+
+
+- Pathways in the intersection: all are up-regulated in LV (n = 3)
+
+```{r}
+getKEGGres_metab <- function(ids, 
+                             df_donor = metabLVRV$metabKEGG, 
+                             HF = "ICM", 
+                             df_hf = metabKegg_icm, 
+                             getPval_for = "P.Up") {
+  tmpDonor <- filter(df_donor, Pathway %in% ids) %>% 
+    dplyr::select(Pathway, getPval_for)
+  colnames(tmpDonor)[2] <- paste("Donor", colnames(tmpDonor)[2], sep = "_")
+  tmpHF <- filter(df_hf, Pathway %in% ids) %>% 
+    dplyr::select(Pathway, getPval_for)
+  colnames(tmpHF)[2] <- paste(HF, colnames(tmpHF)[2], sep = "_")
+  left_join(tmpDonor, tmpHF, by = "Pathway")
+}
+ids <- intersect(metabKEGG_up[[1]], metabKEGG_up[[3]])
+datatable(getKEGGres_metab(ids, df_donor = metabLVRV$metabKEGG, 
+                           HF = "ICM", df_hf = metabKegg_icm, 
+                           getPval_for = "P.Up"))
+```
+
+
+- Pathways up-regulated in donors only (n = 2)
+
+```{r}
+ids <- setdiff(metabKEGG_up[[1]], metabKEGG_up[[3]])
+datatable(getKEGGres_metab(ids, df_donor = metabLVRV$metabKEGG, 
+                           HF = "ICM", df_hf = metabKegg_icm, 
+                           getPval_for = "P.Up"))
+```
+
+
+- Pathways up-regulated in ICM only (n = 23)
+
+```{r}
+ids <- setdiff(metabKEGG_up[[3]], metabKEGG_up[[1]])
+datatable(getKEGGres_metab(ids, df_donor = metabLVRV$metabKEGG, 
+                           HF = "ICM", df_hf = metabKegg_icm, 
+                           getPval_for = "P.Up"))
+```
+
+- Pathways down-regulated in donors only (n = 1)
+
+```{r}
+ids <- setdiff(metabKEGG_down[[1]], metabKEGG_down[[3]])
+datatable(getKEGGres_metab(ids, df_donor = metabLVRV$metabKEGG, 
+                           HF = "ICM", df_hf = metabKegg_icm, 
+                           getPval_for = "P.Down"))
+```
+
+
+- Pathways down-regulated in ICM only (n = 1)
+
+```{r}
+ids <- setdiff(metabKEGG_down[[3]], metabKEGG_down[[1]])
+datatable(getKEGGres_metab(ids, df_donor = metabLVRV$metabKEGG, 
+                           HF = "ICM", df_hf = metabKegg_icm, 
+                           getPval_for = "P.Down"))
+```
+
+<br><br><br><br>
+
+
+
+
+
+# Common KEGG pathways in proteins and metabolites in HF
+
+## DCM
+
+```{r, fig.height=2, fig.width=4}
+# map pathway IDs to names
+kegg_anno <- rownames_to_column(protKegga_icm, "pathid") %>% 
+  dplyr::select(pathid, Pathway)
+kegg_id2name <- function(ids) {
+  filter(kegg_anno, pathid %in% ids)$Pathway
+}
+ggvenn(list(Protein = kegg_id2name(protKEGG$DCM), Metabolite = metabKEGG$DCM), 
+       show_percentage = FALSE, 
+       fill_color = brewer.pal(4, "Accent")[1:2], fill_alpha = 0.8, 
+       stroke_color = "transparent", text_size = 4, 
+       set_name_size = 4) + 
+  ggtitle("Over-represented KEGG pathways in DCM")
+```
+
+No significant (P < 0.05) KEGG pathway overlaps. 
+
+## ICM 
+
+```{r, fig.height=2, fig.width=4}
+ggvenn(list(Protein = kegg_id2name(protKEGG$ICM), Metabolite = metabKEGG$ICM), 
+       show_percentage = FALSE, 
+       fill_color = brewer.pal(4, "Accent")[1:2], fill_alpha = 0.8, 
+       stroke_color = "transparent", text_size = 4, 
+       set_name_size = 4) + 
+  ggtitle("Over-represented KEGG pathways in ICM")
+```
+
+There is one significant (P < 0.05) KEGG pathway in the intersection, which is:
+
+```{r}
+filter(kegg_anno, Pathway %in% intersect(kegg_id2name(protKEGG$ICM), metabKEGG$ICM))
+```
+
+Plot its pathway map: 
+
+```{r, eval=FALSE, include=FALSE}
+library(pathview)
+upProteins <- mutate(icmProt, select.genes = adj.P.Val < 1.01) %>% 
+  mutate(select.genes = ifelse(adj.P.Val < 1.01 & logFC > 0, select.genes+1, select.genes+0)) %>% 
+  mutate(select.genes = recode(select.genes, `1` = -1, `2` = 1))
+# table(upProteins$select.genes)
+upProt_input <- upProteins$select.genes
+names(upProt_input) <- upProteins$GeneID
+
+upMetab <- mutate(icmMetab, select.metab = adj.P.Val < 1.01) %>% 
+  mutate(select.metab = ifelse(adj.P.Val < 1.01 & logFC > 0, select.metab+1, select.metab+0)) %>% 
+  mutate(select.metab = recode(select.metab, `1` = -1, `2` = 1))
+# table(upMetab$select.metab)
+upMetab_input <- upMetab$select.metab
+names(upMetab_input) <- upMetab$KEGG
+
+pathview(gene.data = upProt_input, cpd.data = upMetab_input, 
+         pathway.id = "04151", species = "hsa", 
+         discrete = list(gene = TRUE, cpd = TRUE), 
+         same.layer = FALSE, map.symbol = TRUE, 
+         kegg.native = FALSE, gene.annotpkg = "org.Hs.eg.db")
+pathview(gene.data = upProt_input, cpd.data = upMetab_input, 
+         pathway.id = "04151", species = "hsa", 
+         discrete = list(gene = TRUE, cpd = TRUE), 
+         same.layer = FALSE, map.symbol = TRUE, 
+         kegg.native = TRUE, gene.annotpkg = "org.Hs.eg.db")
+```
+
+![](data/diabeteslabel/pathwayplot/hsa04151.pathview.png)
+
+
+
+
+<br><br><br><br>
+
+# Diabetic vs non-diabetic samples in ICM at the same location
+
+In this section, differential expression analysis is performed to compare diabetic vs non-diabetic samples in ICM patients in the same chamber (LV or RV). Only ICM samples are included in this analysis. Design matrix is constructed to adjust for gender and log2-age. Contrast is specified as diabetic minus non-diabetic at both LV and RV, meaning that positive log-FC indicates higher expression in diabetic than non-diabetic patients. 
+
+## In proteins
+
+### MDS plot 
+
+```{r, fig.width=6, fig.height=4.5}
+ggMDS_icm <- function(dat, meta) {
+  mds <- plotMDS(t(dat), plot = FALSE)
+  data.frame(locBank = rownames(dat), x = mds$x, y = mds$y) %>% 
+    left_join(meta, by = "locBank")
+}
+protMDS_icmOnly <- ggMDS_icm(t(prot[, pmeta$locBank[pmeta$condition == "ICM"]]), 
+                         pmeta)
+
+ggplot(protMDS_icmOnly, aes(x = x, y = y, shape = diabetes, color = location)) + 
+  geom_point(size = 2, stroke = 1.1) + 
+  theme_classic2() + 
+  scale_shape_manual(values = c(16, 2)) + 
+  scale_color_manual(values = c("#C994C7", "#006D2C")) + 
+  labs(x = "Leading logFC dim 1", y = "Leading logFC dim 2", 
+       color = "Location", shape = "Diabetic")
+```
+
+There is only one RV sample in diabetic samples. However, it is quite obvious that at the same location (color), the diabetic (triangles) samples and non-diabetic (dot) samples are well separated by the first MDS dimension (x-axis). 
+
+### DE summary
+
+```{r}
+pmeta_icm <- filter(pmeta, condition == "ICM") %>% 
+  mutate(dbLoc = paste(diabetes, location, sep = "_"))
+design <- model.matrix(~ 0 + dbLoc + log2age + sex, data = pmeta_icm)
+colnames(design)[1:4] <- str_sub(colnames(design)[1:4], start = 6)
+contrasts <- makeContrasts(LV = Yes_LV - No_LV, 
+                           RV = Yes_RV - No_RV, levels = design)
+```
+
+
+```{r}
+prot_icm <- prot[, pmeta_icm$locBank]
+suppressWarnings(dupcor <- duplicateCorrelation(prot_icm, design, 
+                                                block = pmeta_icm$bank))
+correlations <- smooth_genewise_cor(prot_icm, dupcor)
+protfit_icm <- lmFit2(prot_icm, design, block = pmeta_icm$bank, correlation = correlations)
+protfit_icm <- contrasts.fit(protfit_icm, contrasts = contrasts)
+protICM_efit <- eBayes(protfit_icm)
+kable(summary(decideTests(protICM_efit)))
+```
+
+Where up means higher expression in diabetic samples than in non-diabetic samples. 
+
+
+### In LV
+
+```{r}
+protICM_LV <- topTable(protICM_efit, coef = "LV", number = Inf) %>% signif(2) %>% 
+  mutate(GeneID = str_sub(rownames(.), start = 2), .before = 1) %>% 
+  left_join(protLVRV$protDEefit$genes, by = "GeneID") %>% 
+  dplyr::select(GeneID, Symbol, chromosome, type_of_gene, everything()) %>% 
+  filter(!is.na(logFC)) %>% 
+  arrange(adj.P.Val)
+datatable(filter(protICM_LV, adj.P.Val < 0.05), width = "95%", options = list(scrollX = TRUE))
+```
+
+- Volcano plot: 
+
+```{r, fig.height=4, fig.width=7}
+dtProt_ICM <- data.frame(decideTests(protICM_efit)) %>% 
+  rownames_to_column("GeneID") %>% 
+  mutate(GeneID = str_sub(GeneID, start = 2))
+dtProt_ICM_lv_vol <- mutate(protICM_LV, logP = -log10(adj.P.Val)) %>% 
+  left_join(dplyr::select(dtProt_ICM, GeneID, LV), by = "GeneID") %>% 
+  mutate(LV = factor(LV, levels = c(1, -1, 0))) %>% 
+  filter(!is.na(logFC))
+levels(dtProt_ICM_lv_vol$LV) <- c("Up", "Down", "Not significant")
+
+ggplot(dtProt_ICM_lv_vol, aes(x = logFC, y = -log10(adj.P.Val), color = LV)) + 
+  geom_point(size = 0.8) + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", size = 0.4) + 
+  geom_text_repel(data = filter(dtProt_ICM_lv_vol, adj.P.Val < 0.01), 
+                  show.legend = FALSE, 
+            aes(label = Symbol), size = 2.8, color = "black") + 
+  theme_bw() +
+  scale_color_manual(values = brewer.pal(9, "Set1")[c(1, 2, 9)]) + 
+  labs(x = "log2FC", y = "-log10(P-value)", color = "DEP")
+```
+
+
+
+- KEGG pathways
+
+```{r, fig.width=8, fig.height=2.4}
+protICM_efit$genes <- protLVRV$protDEefit$genes
+suppressWarnings(protKegg_icmLV <- kegga(protICM_efit, coef = "LV", species = "Hs", geneid = "GeneID", trend = TRUE))
+pathPval(protKegg_icmLV) + scale_fill_manual(values = brewer.pal(9, "Set1")[1:2])
+topKEGG(protKegg_icmLV, sort = "up", number = Inf) %>% 
+  mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2)) %>% 
+  filter(P.Up < 0.05 | P.Down < 0.05) %>% 
+  datatable
+```
+
+
+
+### In RV
+
+```{r}
+protICM_RV <- topTable(protICM_efit, coef = "RV", number = Inf) %>% 
+  mutate(logFC = signif(logFC, 2), 
+         AveExpr = signif(AveExpr, 2), 
+         t = signif(t, 2), 
+         P.Value = signif(P.Value, 2), 
+         adj.P.Val = signif(adj.P.Val, 2), 
+         B = signif(B, 2)) %>% 
+  dplyr::select(GeneID, Symbol, chromosome, type_of_gene, everything()) %>% 
+  filter(!is.na(logFC)) %>% 
+  arrange(adj.P.Val)
+datatable(filter(protICM_RV, adj.P.Val < 0.05), width = "95%", options = list(scrollX = TRUE))
+```
+
+- Volcano plot: 
+
+```{r, fig.height=4, fig.width=7}
+dtProt_ICM_rv_vol <- mutate(protICM_RV, logP = -log10(adj.P.Val)) %>% 
+  left_join(dplyr::select(dtProt_ICM, GeneID, RV), by = "GeneID") %>% 
+  mutate(RV = factor(RV, levels = c(1, -1, 0))) %>% 
+  filter(!is.na(logFC))
+levels(dtProt_ICM_rv_vol$RV) <- c("Up", "Down", "Not significant")
+
+ggplot(dtProt_ICM_rv_vol, aes(x = logFC, y = -log10(adj.P.Val), color = RV)) + 
+  geom_point(size = 0.8) + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", size = 0.4) + 
+  geom_text_repel(data = filter(dtProt_ICM_rv_vol, adj.P.Val < 0.05), 
+                  show.legend = FALSE, 
+            aes(label = Symbol), size = 2.8, color = "black") + 
+  theme_bw() +
+  scale_color_manual(values = brewer.pal(9, "Set1")[c(2, 9)]) + 
+  labs(x = "log2FC", y = "-log10(P-value)", color = "DEP")
+```
+
+
+
+- KEGG pathways
+
+```{r, fig.width=6, fig.height=2}
+suppressWarnings(protKegg_icmRV <- kegga(protICM_efit, coef = "RV", species = "Hs", geneid = "GeneID", trend = TRUE))
+pathPval(protKegg_icmRV) + scale_fill_manual(values = brewer.pal(9, "Set1")[2])
+topKEGG(protKegg_icmRV, sort = "up", number = Inf) %>% 
+  mutate(P.Up = signif(P.Up, 2), P.Down = signif(P.Down, 2)) %>% 
+  filter(P.Up < 0.05 | P.Down < 0.05) %>% 
+  datatable
+```
+
+
+
+
+
+
+
+
+## In metabolites
+
+Similar analysis is performed. 
+
+### MDS plot 
+
+```{r, fig.width=6, fig.height=4.5}
+mtmeta_icm <- filter(mtmeta, condition == "ICM")
+metab_icm <- metab[, mtmeta_icm$locBank]
+metabMDS_icmOnly <- ggMDS_icm(t(metab_icm), mtmeta_icm)
+
+ggplot(metabMDS_icmOnly, aes(x = x, y = y, shape = diabetes, color = location)) + 
+  geom_point(size = 2, stroke = 1.1) + 
+  theme_classic2() + 
+  scale_shape_manual(values = c(16, 2)) + 
+  scale_color_manual(values = c("#C994C7", "#006D2C")) + 
+  labs(x = "Leading logFC dim 1", y = "Leading logFC dim 2", 
+       color = "Location", shape = "Diabetic")
+```
+
+
+
+### DE summary
+
+```{r}
+mtmeta_icm <- mutate(mtmeta_icm, dbLoc = paste(diabetes, location, sep = "_"))
+design <- model.matrix(~ 0 + dbLoc + log2age + sex, data = mtmeta_icm)
+colnames(design)[1:4] <- str_sub(colnames(design)[1:4], start = 6)
+contrasts <- makeContrasts(LV = Yes_LV - No_LV, 
+                           RV = Yes_RV - No_RV, levels = design)
+```
+
+
+```{r}
+suppressWarnings(dupcor <- duplicateCorrelation(metab_icm, design, 
+                                                block = mtmeta_icm$bank))
+correlations <- smooth_genewise_cor(metab_icm, dupcor)
+metabfit_icm <- lmFit2(metab_icm, design, block = mtmeta_icm$bank, correlation = correlations)
+metabfit_icm <- contrasts.fit(metabfit_icm, contrasts = contrasts)
+metabICM_efit <- eBayes(metabfit_icm, robust = TRUE)
+kable(summary(decideTests(metabICM_efit)))
+```
+
+Nothing significant. But we can still have a look at the top few metabolites. 
+
+- In LV: 
+
+```{r}
+metabICM_LV <- topTable(metabICM_efit, coef = "LV", number = Inf) %>% signif(2) %>% 
+  rownames_to_column("name") %>% 
+  left_join(metabLVRV$metab_anno, by = "name") %>% 
+  dplyr::select(KEGG, HMDB, everything()) %>% 
+  column_to_rownames("name") %>% 
+  filter(!is.na(logFC)) %>% 
+  arrange(adj.P.Val)
+datatable(metabICM_LV, width = "95%", options = list(scrollX = TRUE))
+```
+
+
+- In RV: 
+
+```{r}
+metabICM_RV <- topTable(metabICM_efit, coef = "RV", number = Inf) %>% signif(2) %>% 
+  rownames_to_column("name") %>% 
+  left_join(metabLVRV$metab_anno, by = "name") %>% 
+  dplyr::select(KEGG, HMDB, everything()) %>% 
+  column_to_rownames("name") %>% 
+  filter(!is.na(logFC)) %>% 
+  arrange(adj.P.Val)
+datatable(metabICM_RV, width = "95%", options = list(scrollX = TRUE))
+```
+
+
+
+
+
+
+
+
+<br><br><br><br><br><br><br><br>
+
+# Session information
+
+```{r}
+sessioninfo::session_info()
+```
+
