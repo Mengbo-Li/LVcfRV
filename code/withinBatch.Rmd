@@ -1,0 +1,617 @@
+---
+title: "Molecular differences in LV/RV donor hearts within each Sydney Heart Bank batches (for the rebuttal)"
+author: "Mengbo Li"
+date: "`r Sys.Date()`"
+output: 
+   html_document:
+      code_folding: show
+      toc: true
+      toc_float:
+          collapsed: false
+          smooth_scroll: false
+      toc_depth: 3
+      number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r global options, include = FALSE, cache = FALSE}
+options(max.print = "80", digits = 4)
+knitr::opts_chunk$set(echo = FALSE,
+                      cache = FALSE,
+                      prompt = FALSE,
+                      tidy = TRUE,
+                      comment = NA,
+                      message = FALSE,
+                      warning = FALSE, 
+                      fig.align = "center")
+```
+
+
+# Summary
+
+Perform the same DE analysis within each batch and compare with results from merged data. 
+
+```{r}
+library(here)
+library(tidyverse)
+library(RColorBrewer)
+library(ggpubr)
+library(DT)
+library(pheatmap)
+library(ggrepel)
+library(grid)
+library(ggsci)
+library(ggvenn)
+
+library(Rfast)
+library(ruv)
+library(ruvms)
+library(limma)
+library(org.Hs.eg.db)
+library(KEGGREST)
+
+
+# source(here("data/pathwayVis.R"))
+# replace pastel color for LV/RV
+locolor <- c(brewer.pal(9, "PiYG")[3], brewer.pal(9, "Blues")[7])
+year.col <- brewer.pal(3, "Set2")[c(2, 3)]
+
+source(here("../../Proteomics/230814-utils.R"))
+```
+
+
+# Proteomics data
+
+```{r}
+load("data/230725-prot_metadata_for_eachbatch.rda")
+```
+
+```{r}
+# results from merged data
+# all protein data and meta data, donor topTable LV vs RV
+load("data/network/211115_protData_meta_and_donorLVRVde.rda")
+# > ls()
+# [1] "donor" "pmeta" "pt" 
+donor$GeneID <- paste("G", donor$GeneID, sep = "")
+```
+
+
+## 2018
+
+```{r}
+meta18 <- filter(meta, year == 2018)
+pt18 <- raw[meta18$smpName, ]
+dim(pt18)
+overlap <- colnames(pt18) %in% donor$GeneID
+table(overlap)
+pt18 <- pt18[, overlap]
+
+# total number of samples
+dim(meta18)
+
+# within batch replication
+length(unique(meta18$locBank))
+# given within batch replications (tech reps), perform normalisation
+M <- replicate.matrix(meta18$locBank)
+# dim(M)
+rownames(M) <- rownames(pt18)
+
+# for replications, keep low RLA binwidth
+y_med <- t(sweep(pt18, 2, Rfast::colMedians(pt18, na.rm = TRUE), "-"))
+y_med <- colVars(y_med, na.rm = TRUE, std = TRUE)
+names(y_med) <- rownames(M)
+hasRep <- which(colSums(M) > 1)
+discardRep <- sapply(hasRep, function(rr) {
+  which(y_med[rownames(M)[M[, rr] == 1]] == max(y_med[rownames(M)[M[, rr] == 1]])) |> names()
+})
+
+kp <- setdiff(rownames(pt18), discardRep)
+length(kp)
+
+pt18 <- pt18[kp, ]
+meta18 <- column_to_rownames(meta18, "smpName")
+meta18 <- meta18[kp, ]
+meta18 <- rownames_to_column(meta18, "smpName")
+# individual hearts
+table(meta18$condition[!duplicated(meta18$bank)])
+```
+
+
+
+```{r}
+par(mfrow = c(1, 2))
+RLA(pt18, 
+    repCol = brewer.pal(4, "Set2")[1:3][as.numeric(meta18$condition)], 
+    repLabel = unique(meta18$condition), ylim = c(-2, 2), title = "Raw")
+pt18norm <- normalizeCyclicLoess(t(pt18))
+RLA(t(pt18norm), 
+    repCol = brewer.pal(4, "Set2")[1:3][as.numeric(meta18$condition)], 
+    repLabel = unique(meta18$condition), ylim = c(-2, 2), title = "Cyclic loess")
+```
+
+
+```{r}
+cond.col <- brewer.pal(4, "Set2")[1:3]
+meta18_donor <- filter(meta18, condition == "Donor")
+pt18norm_donor <- pt18norm[, meta18_donor$smpName]
+ggMDS(pt18norm_donor, meta18_donor, "smpName", colour = condition, shape = location, size = 5) + 
+  scale_shape_manual(values = c(16, 5)) + 
+  scale_color_manual(values = cond.col) + 
+  ggtitle("2018")
+
+
+meta18 <- mutate(meta18, group = paste(condition, location, sep = "_")) |> 
+  mutate(log2age = log2(age))
+design <- model.matrix(~ 0 + group + log2age + sex, data = meta18)
+colnames(design)[1:6] <- str_sub(colnames(design)[1:6], start = 6)
+contrasts <- makeContrasts(donor = Donor_LV - Donor_RV, levels = design)
+fit18 <- lmFit(pt18norm, design)
+fit18 <- contrasts.fit(fit18, contrasts = contrasts)
+efit18 <- eBayes(fit18)
+plotSA(efit18)
+summary(decideTests(efit18))
+
+donor18 <- topTable(efit18, coef = 1, number = 8+13)
+donor18 <- rownames(donor18)
+```
+
+
+
+
+
+
+## 2020
+
+```{r}
+meta20 <- filter(meta, year == 2020)
+pt20 <- raw[meta20$smpName, ]
+dim(pt20)
+overlap <- colnames(pt20) %in% donor$GeneID
+table(overlap)
+pt20 <- pt20[, overlap]
+
+# total number of samples
+dim(meta20)
+
+# within batch replication
+length(unique(meta20$locBank))
+# for with in batch replications (tech reps), take the average 
+M <- replicate.matrix(meta20$locBank)
+# dim(M)
+rownames(M) <- rownames(pt20)
+
+
+# for replications, keep low RLA binwidth
+y_med <- t(sweep(pt20, 2, Rfast::colMedians(pt20, na.rm = TRUE), "-"))
+y_med <- colVars(y_med, na.rm = TRUE, std = TRUE)
+names(y_med) <- rownames(M)
+hasRep <- which(colSums(M) > 1)
+discardRep <- sapply(hasRep, function(rr) {
+  which(y_med[rownames(M)[M[, rr] == 1]] == max(y_med[rownames(M)[M[, rr] == 1]])) |> names()
+})
+
+kp <- setdiff(rownames(pt20), discardRep)
+length(kp)
+
+pt20 <- pt20[kp, ]
+meta20 <- column_to_rownames(meta20, "smpName")
+meta20 <- meta20[kp, ]
+meta20 <- rownames_to_column(meta20, "smpName")
+# individual hearts
+table(meta20$condition[!duplicated(meta20$bank)])
+```
+
+
+```{r}
+par(mfrow = c(1, 2))
+RLA(pt20, 
+    repCol = brewer.pal(4, "Set2")[1:3][as.numeric(meta20$condition)], 
+    repLabel = unique(meta20$condition), ylim = c(-3, 2), title = "Raw")
+pt20norm <- normalizeCyclicLoess(t(pt20))
+RLA(t(pt18norm), 
+    repCol = brewer.pal(4, "Set2")[1:3][as.numeric(meta20$condition)], 
+    repLabel = unique(meta20$condition), ylim = c(-3, 2), title = "Cyclic loess")
+```
+
+
+
+
+```{r}
+meta20_donor <- filter(meta20, condition == "Donor")
+pt20norm_donor <- pt20norm[, meta20_donor$smpName]
+mds20_12 <- ggMDS(pt20norm_donor, meta20_donor, "smpName", colour = condition, shape = location, size = 5) + 
+  scale_shape_manual(values = c(16, 5)) + 
+  scale_color_manual(values = cond.col) + 
+  ggtitle("2020")
+mds20_23 <- ggMDS(pt20norm_donor, meta20_donor, "smpName", colour = condition, shape = location, size = 5, dim = 2:3) + 
+  scale_shape_manual(values = c(16, 5)) + 
+  scale_color_manual(values = cond.col) + 
+  ggtitle("2020")
+ggarrange(mds20_12, mds20_23, ncol = 2, nrow = 1)
+
+
+meta20 <- mutate(meta20, group = paste(condition, location, sep = "_")) |> 
+  mutate(log2age = log2(age))
+design <- model.matrix(~ 0 + group + log2age + sex, data = meta20)
+colnames(design)[1:4] <- str_sub(colnames(design)[1:4], start = 6)
+contrasts <- makeContrasts(donor = Donor_LV - Donor_RV, levels = design)
+fit20 <- lmFit(pt20norm, design)
+fit20 <- contrasts.fit(fit20, contrasts = contrasts)
+efit20 <- eBayes(fit20)
+donor20 <- topTable(efit20, coef = 1, number = Inf, sort.by = "p")
+donor20 <- as.character(na.omit(rownames(donor20)[donor20$adj.P.Val <= 0.05]))
+```
+
+```{r}
+donorComb <- donor$GeneID[donor$adj.P.Val <= 0.05]
+
+donorAll <- list(donorComb = donorComb, 
+                 donor18 = donor18, 
+                 donor20 = donor20)
+
+ggvenn(donorAll, show_percentage = FALSE)
+```
+
+```{r}
+# proteins not in the overlap
+## only significant in 18
+diff18 <- setdiff(donor18, donorComb)
+
+wide2df <- function(dat, genes, annotation) {
+  as.data.frame(dat[genes, ]) |> 
+    rownames_to_column("feature") |> 
+    pivot_longer(-feature, names_to = "sample", values_to = "log2int") |> 
+    mutate(annotation = annotation)
+}
+
+diff18_dat <- wide2df(pt18norm, diff18, "2018") |> 
+  add_row(wide2df(pt20norm, diff18, "2020")) |> 
+  add_row(wide2df(pt, diff18, "merged")) |> 
+  mutate(location = ifelse(str_detect(sample, "LV"), "LV", "RV"))
+
+ggplot(diff18_dat, aes(x = location, y = log2int, fill = location, group = location)) + 
+  geom_boxplot() + 
+  facet_wrap(~ feature + annotation, nrow = 2, scales = "free") + 
+  scale_fill_manual(values = c("#e2a8c2", "#98cce4")) + 
+  theme_mengbo() + 
+  labs(x = "", y = "Log2 intensity", fill = "Location")
+
+topTable(efit18, coef = 1, number = Inf)[diff18, c("logFC", "adj.P.Val")]
+topTable(efit20, coef = 1, number = Inf)[diff18, c("logFC", "adj.P.Val")]
+donor[which(donor$GeneID %in% diff18), c("GeneID", "logFC", "adj.P.Val")]
+```
+
+```{r}
+diff20 <- setdiff(donor20, donorComb)
+
+diff20_dat <- wide2df(pt18norm, diff20, "2018") |> 
+  add_row(wide2df(pt20norm, diff20, "2020")) |> 
+  add_row(wide2df(pt, diff20, "merged")) |> 
+  mutate(location = ifelse(str_detect(sample, "LV"), "LV", "RV"))
+
+ggplot(diff20_dat, aes(x = location, y = log2int, fill = location, group = location)) + 
+  geom_boxplot() + 
+  facet_wrap(~ feature + annotation, nrow = length(diff20), scales = "free") + 
+  scale_fill_manual(values = c("#e2a8c2", "#98cce4")) + 
+  theme_mengbo() + 
+  labs(x = "", y = "Log2 intensity", fill = "Location")
+
+topTable(efit18, coef = 1, number = Inf)[diff20, c("logFC", "adj.P.Val")]
+topTable(efit20, coef = 1, number = Inf)[diff20, c("logFC", "adj.P.Val")]
+donor[which(donor$GeneID %in% diff20), c("GeneID", "logFC", "adj.P.Val")]
+```
+
+
+## If simply concatenated
+
+
+```{r}
+length(donor$GeneID)
+pt <- cbind(pt18norm[donor$GeneID, ], pt20norm[donor$GeneID, ])
+meta <- rbind(meta18, meta20)
+
+meta_donor <- filter(meta, condition == "Donor")
+pt_donor <- pt[, meta_donor$smpName]
+ggMDS(pt_donor, meta_donor, "smpName", colour = year, shape = location, size = 5) + 
+  scale_shape_manual(values = c(16, 5)) + 
+  scale_color_manual(values = year.col) + 
+  ggtitle("2018 and 2020")
+```
+
+
+```{r}
+meta <- mutate(meta, group = paste(condition, location, sep = "_")) |> 
+  mutate(log2age = log2(age))
+design <- model.matrix(~ 0 + group + log2age + sex + year + bank, data = meta)
+colnames(design)[1:6] <- str_sub(colnames(design)[1:6], start = 6)
+contrasts <- makeContrasts(donor = Donor_LV - Donor_RV, levels = design)
+fit <- lmFit(pt, design)
+fit <- contrasts.fit(fit, contrasts = contrasts)
+efit <- eBayes(fit)
+summary(decideTests(efit))
+
+donor_1820 <- topTable(efit, coef = 1, number = 202+233)
+donor_1820 <- rownames(donor_1820)
+```
+
+```{r}
+donorAll <- list(donorComb = donorComb, 
+                 donor_1820 = donor_1820)
+
+ggvenn(donorAll, show_percentage = FALSE)
+```
+
+
+```{r}
+# within batch compared with concatenated
+donorAll <- list(donor18 = donor18,
+                 donor20 = donor20,  
+                 donor_1820 = donor_1820)
+ggvenn(donorAll)
+```
+
+
+
+
+# Metabolomics
+
+```{r}
+load("data/231024-mtb_metadata_for_eachbatch.rda")
+# > ls()
+# [1] "mtb"      "mtb_meta"
+```
+
+
+```{r}
+# results from merged data
+load("data/231024_mtData_meta_and_donorLVRVde.rda")
+# > ls()
+# [1] "donor"    "mtb_meta" "mtbAnorm"
+donor$GeneID <- rownames(donor)
+```
+
+
+## 2018
+
+```{r}
+meta <- mtb_meta
+meta18 <- filter(meta, year == 2018)
+mtb18 <- mtb[meta18$sample, ]
+dim(mtb18)
+overlap <- colnames(mtb18) %in% donor$GeneID
+table(overlap)
+
+# total number of samples
+dim(meta18)
+
+# within batch replication
+length(unique(meta18$locBank))
+# given within batch replications (tech reps), perform normalisation
+M <- replicate.matrix(meta18$locBank)
+# dim(M)
+rownames(M) <- rownames(mtb18)
+
+# for replications, keep low RLA binwidth
+y_med <- t(sweep(mtb18, 2, Rfast::colMedians(mtb18, na.rm = TRUE), "-"))
+y_med <- colVars(y_med, na.rm = TRUE, std = TRUE)
+names(y_med) <- rownames(M)
+hasRep <- which(colSums(M) > 1)
+discardRep <- sapply(hasRep, function(rr) {
+  which(y_med[rownames(M)[M[, rr] == 1]] == max(y_med[rownames(M)[M[, rr] == 1]])) |> names()
+})
+
+kp <- setdiff(rownames(mtb18), discardRep)
+length(kp)
+
+mtb18 <- mtb18[kp, ]
+meta18 <- column_to_rownames(meta18, "sample")
+meta18 <- meta18[kp, ]
+meta18 <- rownames_to_column(meta18, "sample")
+# individual hearts
+table(meta18$condition[!duplicated(meta18$bank)])
+```
+
+
+
+```{r}
+par(mfrow = c(1, 2))
+RLA(mtb18, 
+    repCol = brewer.pal(4, "Set2")[1:3][as.numeric(meta18$condition)], 
+    repLabel = unique(meta18$condition), ylim = c(-1.5, 2.2), title = "Raw")
+mtb18norm <- normalizeCyclicLoess(t(mtb18))
+RLA(t(mtb18norm), 
+    repCol = brewer.pal(4, "Set2")[1:3][as.numeric(meta18$condition)], 
+    repLabel = unique(meta18$condition), ylim = c(-1.5, 2.2), title = "Cyclic loess")
+```
+
+
+```{r}
+cond.col <- brewer.pal(4, "Set2")[1:3]
+meta18_donor <- filter(meta18, condition == "Donor")
+mtb18norm_donor <- mtb18norm[, meta18_donor$sample]
+ggMDS(mtb18norm_donor, meta18_donor, "sample", colour = condition, shape = location, size = 5) + 
+  geom_text(aes(label = sample), color = "black") +
+  scale_shape_manual(values = c(16, 5)) + 
+  scale_color_manual(values = cond.col) + 
+  ggtitle("2018")
+outlier <- c("LV_3.064_54", "LV_1.120_77")
+
+meta18 <- filter(meta18, !(sample %in% outlier))
+mtb18norm <- mtb18norm[, meta18$sample]
+meta18_donor <- filter(meta18, condition == "Donor")
+mtb18norm_donor <- mtb18norm[, meta18_donor$sample]
+
+mds18_12 <- ggMDS(mtb18norm_donor, meta18_donor, "sample", colour = condition, shape = location, size = 5) + 
+  scale_shape_manual(values = c(16, 5)) + 
+  scale_color_manual(values = cond.col) + 
+  ggtitle("2018")
+mds18_23 <- ggMDS(mtb18norm_donor, meta18_donor, "sample", colour = condition, shape = location, size = 5, dim = 2:3) + 
+  scale_shape_manual(values = c(16, 5)) + 
+  scale_color_manual(values = cond.col) + 
+  ggtitle("2018")
+ggarrange(mds18_12, mds18_23, ncol = 2, nrow = 1)
+
+
+meta18 <- mutate(meta18, group = paste(condition, location, sep = "_")) |> 
+  mutate(log2age = log2(age))
+design <- model.matrix(~ 0 + group + log2age + sex, data = meta18)
+colnames(design)[1:6] <- str_sub(colnames(design)[1:6], start = 6)
+contrasts <- makeContrasts(donor = Donor_LV - Donor_RV, levels = design)
+fit18 <- lmFit(mtb18norm, design)
+fit18 <- contrasts.fit(fit18, contrasts = contrasts)
+efit18 <- eBayes(fit18)
+plotSA(efit18)
+summary(decideTests(efit18))
+
+donor18 <- NULL
+```
+
+## 2020
+
+```{r}
+load("data/231024-mtb_metadata_for_eachbatch.rda")
+meta <- mtb_meta
+meta20 <- filter(meta, year == 2020)
+mtb20 <- mtb[meta20$sample, ]
+dim(mtb20)
+overlap <- colnames(mtb20) %in% donor$GeneID
+table(overlap)
+
+
+# total number of samples
+dim(meta20)
+
+# within batch replication
+length(unique(meta20$locBank))
+# given within batch replications (tech reps), perform normalisation
+M <- replicate.matrix(meta20$locBank)
+dim(M)
+rownames(M) <- rownames(mtb20)
+
+# for replications, keep low RLA binwidth
+y_med <- t(sweep(mtb20, 2, Rfast::colMedians(mtb20, na.rm = TRUE), "-"))
+y_med <- colVars(y_med, na.rm = TRUE, std = TRUE)
+names(y_med) <- rownames(M)
+hasRep <- which(colSums(M) > 1)
+discardRep <- sapply(hasRep, function(rr) {
+  which(y_med[rownames(M)[M[, rr] == 1]] == max(y_med[rownames(M)[M[, rr] == 1]])) |> names()
+})
+
+kp <- setdiff(rownames(mtb20), discardRep)
+length(kp)
+
+mtb20 <- mtb20[kp, ]
+meta20 <- column_to_rownames(meta20, "sample")
+meta20 <- meta20[kp, ]
+meta20 <- rownames_to_column(meta20, "sample")
+# individual hearts
+table(meta20$condition[!duplicated(meta20$bank)])
+```
+
+
+
+```{r}
+par(mfrow = c(1, 2))
+RLA(mtb20, 
+    repCol = brewer.pal(4, "Set2")[1:3][as.numeric(meta20$condition)], 
+    repLabel = levels(meta20$condition)[c(3, 1, 2)], ylim = c(-1.5, 2.2), title = "Raw")
+mtb20norm <- normalizeCyclicLoess(t(mtb20))
+RLA(t(mtb20norm), 
+    repCol = brewer.pal(4, "Set2")[1:3][as.numeric(meta20$condition)], 
+    repLabel = levels(meta20$condition)[c(3, 1, 2)], ylim = c(-1.5, 2.2), title = "Cyclic loess")
+```
+
+```{r}
+meta20_donor <- filter(meta20, condition == "Donor")
+mtb20norm_donor <- mtb20norm[, meta20_donor$sample]
+ggMDS(mtb20norm_donor, meta20_donor, "sample", colour = condition, shape = location, size = 5) + 
+  scale_shape_manual(values = c(16, 5)) + 
+  scale_color_manual(values = cond.col) + 
+  ggtitle("2020")
+
+
+meta20 <- mutate(meta20, group = paste(condition, location, sep = "_")) |> 
+  mutate(log2age = log2(age))
+design <- model.matrix(~ 0 + group + log2age + sex, data = meta20)
+colnames(design)[1:6] <- str_sub(colnames(design)[1:6], start = 6)
+contrasts <- makeContrasts(donor = Donor_LV - Donor_RV, levels = design)
+fit20 <- lmFit(mtb20norm, design)
+fit20 <- contrasts.fit(fit20, contrasts = contrasts)
+efit20 <- eBayes(fit20)
+plotSA(efit20)
+summary(decideTests(efit20))
+
+donor20 <- topTable(efit20, coef = 1, number = 1)
+(donor20 <- rownames(donor20))
+```
+
+
+```{r}
+donorComb <- rownames(donor)[donor$adj.P.Val <= 0.05]
+
+donorAll <- list(donorComb = donorComb, 
+                 donor18 = NA, 
+                 donor20 = donor20)
+
+ggvenn(donorAll, show_percentage = FALSE)
+```
+
+
+
+
+## If simply concatenated
+
+```{r}
+length(donor$GeneID)
+mtb <- cbind(mtb18norm[donor$GeneID, ], mtb20norm[donor$GeneID, ])
+meta <- rbind(meta18, meta20)
+
+meta_donor <- filter(meta, condition == "Donor")
+mtb_donor <- mtb[, meta_donor$sample]
+dim(mtb_donor)
+ggMDS(mtb_donor, meta_donor, "sample", colour = year, shape = location, size = 5) + 
+  scale_shape_manual(values = c(16, 5)) + 
+  scale_color_manual(values = year.col) + 
+  ggtitle("2018 and 2020")
+```
+
+
+```{r}
+meta <- mutate(meta, group = paste(condition, location, sep = "_")) |> 
+  mutate(log2age = log2(age))
+design <- model.matrix(~ 0 + group + log2age + sex + year + bank, data = meta)
+colnames(design)[1:6] <- str_sub(colnames(design)[1:6], start = 6)
+contrasts <- makeContrasts(donor = Donor_LV - Donor_RV, levels = design)
+fit <- lmFit(mtb, design)
+fit <- contrasts.fit(fit, contrasts = contrasts)
+efit <- eBayes(fit)
+summary(decideTests(efit))
+
+donor_1820 <- topTable(efit, coef = 1, number = 6+8)
+(donor_1820 <- rownames(donor_1820))
+```
+
+```{r}
+donorAll <- list(donorComb = donorComb, 
+                 donor_1820 = donor_1820)
+
+ggvenn(donorAll, show_percentage = FALSE)
+```
+
+```{r}
+# within batch compared with concatenated
+donorAll <- list(donor18 = NA,
+                 donor20 = donor20,  
+                 donor_1820 = donor_1820)
+ggvenn(donorAll)
+```
+
+# Session information
+
+```{r}
+sessioninfo::session_info()
+```
+
+
